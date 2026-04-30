@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Lip Sync Test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; color: #eee; font-family: system-ui; }
+    #canvas-container { width: 100%; height: 60vh; position: relative; }
+    #controls {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .row label { min-width: 100px; font-size: 14px; }
+    button {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 6px;
+      background: #4361ee;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover { background: #3a56d4; }
+    button.active { background: #f72585; }
+    button.green { background: #2d6a4f; }
+    button.green:hover { background: #40916c; }
+    #status { padding: 10px 20px; font-size: 13px; color: #888; }
+  </style>
+</head>
+<body>
+  <div id="canvas-container"></div>
+  <div id="controls">
+    <div class="row">
+      <label>Visemes:</label>
+      <button onclick="testViseme('X')">X (Rest)</button>
+      <button onclick="testViseme('A')">A (MBP)</button>
+      <button onclick="testViseme('B')">B (EE)</button>
+      <button onclick="testViseme('C')">C (EH)</button>
+      <button onclick="testViseme('D')">D (AI)</button>
+      <button onclick="testViseme('E')">E (OH)</button>
+      <button onclick="testViseme('F')">F (OO)</button>
+      <button onclick="testViseme('G')">G (FV)</button>
+      <button onclick="testViseme('H')">H (L/TH)</button>
+    </div>
+    <div class="row">
+      <label>Sequences:</label>
+      <button class="green" onclick="playDemo()">Play Demo Sequence</button>
+      <button class="green" onclick="playHello()">Play "Hello"</button>
+      <button class="green" onclick="playCycle()">Cycle All Visemes</button>
+    </div>
+  </div>
+  <div id="status">Loading model...</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/loaders/GLTFLoader": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js",
+      "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
+    import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+
+    const container = document.getElementById('canvas-container');
+    const status = document.getElementById('status');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.01, 200);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+    const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+    dir.position.set(3, 8, 5);
+    scene.add(dir);
+    scene.add(new THREE.PointLight(0xffffff, 1.2, 0, 0).translateZ(5).translateY(2));
+
+    let mixer = null;
+    let headMesh = null;
+    let morphTargetMap = {};
+
+    const VISEME_NAMES = ['viseme_A', 'viseme_B', 'viseme_C', 'viseme_D',
+                          'viseme_E', 'viseme_F', 'viseme_G', 'viseme_H'];
+
+    const RHUBARB_TO_VISEME = {
+      'A': 'viseme_A', 'B': 'viseme_B', 'C': 'viseme_C', 'D': 'viseme_D',
+      'E': 'viseme_E', 'F': 'viseme_F', 'G': 'viseme_G', 'H': 'viseme_H',
+      'X': null,
+    };
+
+    function resetAllVisemes() {
+      if (!headMesh || !headMesh.morphTargetInfluences) return;
+      for (const name of VISEME_NAMES) {
+        const idx = morphTargetMap[name];
+        if (idx !== undefined) headMesh.morphTargetInfluences[idx] = 0;
+      }
+    }
+
+    function setViseme(letter, weight = 1.0) {
+      resetAllVisemes();
+      const visemeName = RHUBARB_TO_VISEME[letter];
+      if (visemeName && morphTargetMap[visemeName] !== undefined) {
+        headMesh.morphTargetInfluences[morphTargetMap[visemeName]] = weight;
+      }
+      status.textContent = `Viseme: ${letter} (${visemeName || 'rest'}) weight: ${weight.toFixed(2)}`;
+    }
+
+    // Expose to window for button handlers
+    window.testViseme = (letter) => setViseme(letter, 1.0);
+
+    window.playDemo = () => {
+      const cues = [
+        { start: 0.0, end: 0.15, value: 'X' },
+        { start: 0.15, end: 0.35, value: 'C' },
+        { start: 0.35, end: 0.55, value: 'D' },
+        { start: 0.55, end: 0.75, value: 'B' },
+        { start: 0.75, end: 0.95, value: 'F' },
+        { start: 0.95, end: 1.15, value: 'C' },
+        { start: 1.15, end: 1.35, value: 'E' },
+        { start: 1.35, end: 1.55, value: 'D' },
+        { start: 1.55, end: 1.75, value: 'A' },
+        { start: 1.75, end: 1.95, value: 'B' },
+        { start: 1.95, end: 2.15, value: 'F' },
+        { start: 2.15, end: 2.35, value: 'C' },
+        { start: 2.35, end: 2.50, value: 'X' },
+      ];
+      playCues(cues);
+    };
+
+    window.playHello = () => {
+      const cues = [
+        { start: 0.0, end: 0.08, value: 'X' },
+        { start: 0.08, end: 0.20, value: 'H' },  // H
+        { start: 0.20, end: 0.35, value: 'C' },   // eh
+        { start: 0.35, end: 0.50, value: 'H' },   // l
+        { start: 0.50, end: 0.70, value: 'E' },   // oh
+        { start: 0.70, end: 0.85, value: 'X' },
+      ];
+      playCues(cues);
+    };
+
+    window.playCycle = () => {
+      const letters = ['X', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'X'];
+      const cues = letters.map((v, i) => ({
+        start: i * 0.4,
+        end: (i + 1) * 0.4,
+        value: v,
+      }));
+      playCues(cues);
+    };
+
+    let lipSyncActive = false;
+    let mouthCueQueue = [];
+    let lipSyncStartTime = 0;
+
+    function playCues(cues) {
+      mouthCueQueue = cues;
+      lipSyncStartTime = Date.now();
+      lipSyncActive = true;
+      status.textContent = `Playing ${cues.length} cues...`;
+    }
+
+    function updateLipSync() {
+      if (!lipSyncActive || mouthCueQueue.length === 0) return;
+      const elapsed = (Date.now() - lipSyncStartTime) / 1000;
+
+      let activeCue = null;
+      for (const cue of mouthCueQueue) {
+        if (elapsed >= cue.start && elapsed < cue.end) {
+          activeCue = cue;
+          break;
+        }
+      }
+
+      if (!activeCue) {
+        if (elapsed >= mouthCueQueue[mouthCueQueue.length - 1].end) {
+          lipSyncActive = false;
+          resetAllVisemes();
+          status.textContent = 'Playback complete';
+        }
+        return;
+      }
+
+      const cueDuration = activeCue.end - activeCue.start;
+      const cueProgress = (elapsed - activeCue.start) / cueDuration;
+      const weight = Math.sin(cueProgress * Math.PI) * 0.85 + 0.15;
+
+      resetAllVisemes();
+      const visemeName = RHUBARB_TO_VISEME[activeCue.value];
+      if (visemeName && morphTargetMap[visemeName] !== undefined) {
+        headMesh.morphTargetInfluences[morphTargetMap[visemeName]] = Math.min(1.0, weight);
+      }
+      status.textContent = `Playing: ${activeCue.value} (${visemeName || 'rest'}) t=${elapsed.toFixed(2)}s w=${weight.toFixed(2)}`;
+    }
+
+    // Load model
+    const loader = new GLTFLoader();
+    loader.load('/indian_doctor_lipsync.glb',
+      (gltf) => {
+        const model = gltf.scene;
+
+        model.traverse((node) => {
+          if (node.isMesh) {
+            if (node.isSkinnedMesh) {
+              node.visible = true;
+              node.frustumCulled = false;
+              if (node.morphTargetDictionary && Object.keys(node.morphTargetDictionary).length > 0) {
+                headMesh = node;
+                morphTargetMap = { ...node.morphTargetDictionary };
+                console.log('Found morph targets on:', node.name, morphTargetMap);
+              }
+            } else {
+              node.material = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+              node.visible = true;
+              node.frustumCulled = false;
+            }
+          }
+        });
+
+        scene.add(model);
+
+        const box = new THREE.Box3().setFromObject(model);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+
+        // Focus on face
+        const lookY = box.min.y + size.y * 0.50;
+        const dist = size.y * 0.35;
+        camera.position.set(center.x, lookY, center.z + dist);
+        camera.lookAt(center.x, lookY, center.z);
+        controls.target.set(center.x, lookY, center.z);
+
+        if (gltf.animations.length > 0) {
+          mixer = new THREE.AnimationMixer(model);
+          mixer.clipAction(gltf.animations[0]).play();
+        }
+
+        if (headMesh) {
+          status.textContent = `Loaded! ${Object.keys(morphTargetMap).length} morph targets found. Click viseme buttons to test.`;
+        } else {
+          status.textContent = 'WARNING: No morph targets found on any mesh!';
+        }
+      },
+      (progress) => {
+        if (progress.total) {
+          status.textContent = `Loading: ${(progress.loaded / progress.total * 100).toFixed(0)}%`;
+        }
+      },
+      (err) => { status.textContent = 'Error: ' + err.message; }
+    );
+
+    function animate() {
+      requestAnimationFrame(animate);
+      if (mixer) mixer.update(0.016);
+      controls.update();
+      updateLipSync();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    });
+  </script>
+</body>
+</html>

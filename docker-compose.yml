@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_PROVIDER=gpt
+      - GPT_API_KEY=${GPT_API_KEY}
+      - OLLAMA_URL=http://ollama:11434
+      - DEBUG=False
+      - CORS_ORIGINS=["http://localhost:3000", "http://localhost:8080"]
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - ollama
+    networks:
+      - chronexa-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend/src:/app/src
+    depends_on:
+      - backend
+    networks:
+      - chronexa-network
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - chronexa-network
+
+networks:
+  chronexa-network:
+    driver: bridge
+
+volumes:
+  ollama-data:

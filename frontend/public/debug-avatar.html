@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Avatar Test</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #222; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #status { position: fixed; top: 10px; left: 10px; color: lime; font: 14px monospace; background: rgba(0,0,0,0.8); padding: 8px; z-index: 10; white-space: pre; }
+  </style>
+</head>
+<body>
+  <div id="status">Loading...</div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/loaders/GLTFLoader": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js",
+      "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
+    import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+
+    const status = document.getElementById('status');
+    const log = (msg) => { status.textContent += '\n' + msg; console.log(msg); };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xffffff);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+    const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+    dir.position.set(3, 8, 5);
+    scene.add(dir);
+    const fl = new THREE.PointLight(0xffffff, 1.2);
+    fl.position.set(0, 2, 5);
+    scene.add(fl);
+
+    log('Scene created');
+
+    const loader = new GLTFLoader();
+    loader.load('/indian_doctor.glb',
+      (gltf) => {
+        const model = gltf.scene;
+        model.position.set(0, 0, 0);
+        model.rotation.set(0, 0, 0);
+        model.scale.set(1, 1, 1);
+        
+        // Force all meshes to be visible with a simple material
+        let meshCount = 0;
+        let skinnedCount = 0;
+        model.traverse((node) => {
+          if (node.isMesh) {
+            meshCount++;
+            if (node.isSkinnedMesh) {
+              skinnedCount++;
+              // For skinned meshes, keep original material but ensure visibility
+              node.visible = true;
+              node.frustumCulled = false;
+            } else {
+              node.material = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+              node.visible = true;
+              node.frustumCulled = false;
+            }
+          }
+        });
+        log('Meshes: ' + meshCount + ' (skinned: ' + skinnedCount + ')');
+        
+        scene.add(model);
+
+        const box = new THREE.Box3().setFromObject(model);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+
+        log('Model loaded!');
+        log('min: ' + box.min.x.toFixed(2) + ', ' + box.min.y.toFixed(2) + ', ' + box.min.z.toFixed(2));
+        log('max: ' + box.max.x.toFixed(2) + ', ' + box.max.y.toFixed(2) + ', ' + box.max.z.toFixed(2));
+        log('size: ' + size.x.toFixed(2) + ' x ' + size.y.toFixed(2) + ' x ' + size.z.toFixed(2));
+        log('center: ' + center.x.toFixed(2) + ', ' + center.y.toFixed(2) + ', ' + center.z.toFixed(2));
+
+        // Camera: look at model center, far enough to see everything
+        const maxDim = Math.max(size.x, size.y, size.z);
+        camera.position.set(center.x, center.y, center.z + maxDim * 1.5);
+        camera.lookAt(center.x, center.y, center.z);
+
+        // Add orbit controls for manual rotation
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(center.x, center.y, center.z);
+        controls.update();
+
+        log('Camera at full view - use mouse to orbit');
+
+        // Add a debug cube at model center
+        const debugCube = new THREE.Mesh(
+          new THREE.BoxGeometry(0.2, 0.2, 0.2),
+          new THREE.MeshBasicMaterial({ color: 0xff0000 })
+        );
+        debugCube.position.set(center.x, center.y, center.z);
+        scene.add(debugCube);
+
+        // Add axis helper
+        const axesHelper = new THREE.AxesHelper(2);
+        axesHelper.position.set(center.x, box.min.y, center.z);
+        scene.add(axesHelper);
+
+        // Add a wireframe box showing the bounding box
+        const bbHelper = new THREE.Box3Helper(box, 0x00ff00);
+        scene.add(bbHelper);
+
+        let mixer = null;
+        if (gltf.animations.length > 0) {
+          mixer = new THREE.AnimationMixer(model);
+          mixer.clipAction(gltf.animations[0]).play();
+          log('Anim: ' + gltf.animations[0].name);
+        }
+
+        function animate() {
+          requestAnimationFrame(animate);
+          if (mixer) mixer.update(0.016);
+          controls.update();
+          renderer.render(scene, camera);
+        }
+        animate();
+        log('Rendering!');
+      },
+      (p) => {
+        if (p.total > 0) {
+          const pct = Math.round(p.loaded / p.total * 100);
+          status.textContent = 'Loading model: ' + pct + '%';
+        } else {
+          status.textContent = 'Loading: ' + Math.round(p.loaded / 1024) + ' KB';
+        }
+      },
+      (err) => { log('ERROR: ' + (err.message || err)); }
+    );
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,1485 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #f5f5f5; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/loaders/GLTFLoader": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xffffff);
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    // Lighting — pure ambient, zero directional/point lights
+    scene.add(new THREE.AmbientLight(0xffffff, 2.5));
+
+    let mixer = null;
+    let model = null;
+    let clock = new THREE.Clock();
+
+    // ─── Lip Sync State ───
+    let headMesh = null;
+    let morphTargetMap = {};
+    let morphMeshes = [];  // ALL meshes with morph targets (face + teeth)
+    let mouthCueQueue = [];
+    let lipSyncStartTime = 0;
+    let lipSyncActive = false;
+
+    // ─── Hand gesture state ───
+    let skeleton = null;
+    let leftUpperArm = null;
+    let rightUpperArm = null;
+    let leftForeArm = null;
+    let rightForeArm = null;
+    let leftHand = null;
+    let rightHand = null;
+    let headBone = null;
+    let neckBone = null;
+    let gestureActive = false;
+    let gestureStartTime = 0;
+    let gestureDuration = 0;
+    let gestureType = 0;
+    let speechEndTime = 0;
+    let gestureChainIndex = 0;
+    let gestureQueue = [];
+    let isFirstResponse = true;     // wave on first response
+    // Store rest pose quaternions
+    const restPose = {};
+    // Interlocked fingers idle pose (Euler offsets from T-pose rest)
+    // Axis map (from testing):
+    //   Upper arm: +X = arm down, -Z(right)/+Z(left) = arm forward
+    //   Forearm:   +X = drop down, -X = bend up
+    const IDLE_POSE = {
+      rightUpper: [1.36, 0, 0],             // ~78° down from T-pose
+      rightFore:  [0, 0, 0],                // forearm hangs naturally
+      rightHand:  [0, 0, 0],                // hand relaxed
+      leftUpper:  [1.36, 0, 0],             // mirror
+      leftFore:   [0, 0, 0],
+      leftHand:   [0, 0, 0],
+    };
+    // Pre-computed idle target quaternions (set after bones are found)
+    const idlePoseQuats = {};
+
+    // 15 Oculus viseme names (matching our GLB morph targets)
+    const OCULUS_VISEMES = [
+      'viseme_aa', 'viseme_E', 'viseme_I', 'viseme_O', 'viseme_U',
+      'viseme_PP', 'viseme_SS', 'viseme_TH', 'viseme_DD', 'viseme_FF',
+      'viseme_kk', 'viseme_nn', 'viseme_RR', 'viseme_CH', 'viseme_sil'
+    ];
+
+    // Map Rhubarb shapes (A-X) → Oculus viseme names
+    const RHUBARB_TO_OCULUS = {
+      'A': 'viseme_PP',   // MBP - lips pressed
+      'B': 'viseme_I',    // EE - wide spread
+      'C': 'viseme_E',    // EH - mid open
+      'D': 'viseme_aa',   // AI - wide open
+      'E': 'viseme_O',    // OH - rounded open
+      'F': 'viseme_U',    // OO/W - tight round
+      'G': 'viseme_FF',   // F/V - labiodental
+      'H': 'viseme_TH',   // L/TH - tongue tip
+      'X': 'viseme_sil',  // rest/silence
+    };
+
+    // ─── HeadAudio integration (real-time audio-driven lip sync) ───
+    // This is the PRIMARY lip sync system — analyzes audio waveform in
+    // real time and maps frequency content to Oculus visemes, just like
+    // professional avatar services (HeyGen, D-ID, Ready Player Me).
+    let headAudio = null;
+    let audioCtx = null;
+    let headAudioReady = false;
+    let headAudioSpeaking = false;  // true while HeadAudio detects speech
+
+    // Per-viseme SCALE factors for HeadAudio output.
+    // HeadAudio outputs 0–1; we multiply by these to get final weight.
+    // This preserves speech dynamics (louder = slightly more movement)
+    // while keeping cheek-affecting shapes restrained.
+    const HA_SCALE = {
+      'viseme_sil': 0.00,
+      'viseme_PP':  0.60,   // M/B/P — lips press
+      'viseme_FF':  0.50,   // F/V
+      'viseme_TH':  0.35,   // Th
+      'viseme_DD':  0.40,   // T/D
+      'viseme_kk':  0.30,   // K/G
+      'viseme_CH':  0.38,   // Ch/J/Sh
+      'viseme_SS':  0.28,   // S/Z
+      'viseme_nn':  0.32,   // N/L
+      'viseme_RR':  0.38,   // R
+      'viseme_aa':  0.55,   // Ah — jaw
+      'viseme_E':   0.12,   // Eh — cheeks — keep low
+      'viseme_I':   0.10,   // Ee — cheeks — keep low
+      'viseme_O':   0.50,   // Oh — lips
+      'viseme_U':   0.45,   // Oo — lips
+    };
+
+    async function initHeadAudio() {
+      try {
+        audioCtx = new AudioContext({ sampleRate: 44100 });
+
+        // Register worklet processor
+        await audioCtx.audioWorklet.addModule('/headaudio/headworklet.min.mjs');
+
+        // Dynamically import HeadAudio class
+        const { HeadAudio } = await import('/headaudio/headaudio.min.mjs');
+
+        // Create HeadAudio node
+        headAudio = new HeadAudio(audioCtx, {
+          processorOptions: {},
+          parameterData: {
+            vadGateActiveDb: -35,
+            vadGateInactiveDb: -55,
+            speakerMeanHz: 220  // female voice (Indian accent)
+          }
+        });
+
+        // Load pre-trained viseme model
+        await headAudio.loadModel('/headaudio/model-en-mixed.bin');
+
+        // Real-time viseme callback — scale values per-viseme and
+        // feed into the smoothing system
+        headAudio.onvalue = (key, value) => {
+          const scale = HA_SCALE[key];
+          if (scale === undefined) return;
+          targetWeights[key] = value * scale;
+        };
+
+        headAudio.onstarted = () => {
+          headAudioSpeaking = true;
+          // Disable cue-based lip sync — HeadAudio is driving now
+          lipSyncActive = false;
+          console.log('[HeadAudio] Speech detected — driving lip sync');
+        };
+
+        headAudio.onended = () => {
+          headAudioSpeaking = false;
+          resetAllVisemes();
+          console.log('[HeadAudio] Speech ended');
+        };
+
+        headAudioReady = true;
+        console.log('[HeadAudio] Initialized — real-time audio lip sync ready');
+      } catch (err) {
+        console.warn('[HeadAudio] Init failed — will use cue-based fallback:', err.message);
+        headAudioReady = false;
+      }
+    }
+
+    // Connect audio to HeadAudio for analysis + playback
+    async function connectAudioToHeadAudio(audioUrl) {
+      // Lazy init: browser blocks AudioContext before user interaction
+      if (!headAudioReady) {
+        await initHeadAudio();
+      }
+      if (!headAudioReady || !headAudio || !audioCtx) return false;
+
+      try {
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+        const response = await fetch(audioUrl);
+        const arrayBuffer = await response.arrayBuffer();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+
+        source.connect(headAudio);
+        source.connect(audioCtx.destination);
+
+        source.onended = () => {
+          headAudioSpeaking = false;
+          stopGestures(); // Stop gestures when audio finishes
+          resetAllVisemes();
+          window.parent.postMessage({ type: 'audioEnded' }, '*');
+        };
+
+        source.start();
+        console.log('[HeadAudio] Playing audio with real-time lip sync');
+        return true;
+      } catch (err) {
+        console.warn('[HeadAudio] Audio connect failed:', err.message);
+        return false;
+      }
+    }
+
+    // ─── Morph target helpers ───
+
+    // Current smoothed viseme weights (lerped every frame)
+    const currentWeights = {};
+    const targetWeights = {};
+    OCULUS_VISEMES.forEach(v => { currentWeights[v] = 0; targetWeights[v] = 0; });
+
+    // Smoothing: higher = snappier mouth response
+    const LERP_SPEED = 0.25;
+
+    // Per-viseme weight caps — these are the PEAK weights.
+    // Lip/jaw shapes get strong values; cheek-affecting shapes stay low.
+    const VISEME_MAX = {
+      'viseme_sil': 0.00,
+      'viseme_PP':  0.60,   // M/B/P — lips press (most visible)
+      'viseme_FF':  0.50,   // F/V — lower lip tucks
+      'viseme_TH':  0.35,   // Th — tongue tip
+      'viseme_DD':  0.40,   // T/D — tongue tap
+      'viseme_kk':  0.30,   // K/G — back throat
+      'viseme_CH':  0.38,   // Ch/J/Sh
+      'viseme_SS':  0.28,   // S/Z — teeth parted
+      'viseme_nn':  0.32,   // N/L
+      'viseme_RR':  0.38,   // R
+      'viseme_aa':  0.55,   // Ah — jaw open
+      'viseme_E':   0.12,   // Eh — cheek stretcher — keep low
+      'viseme_I':   0.10,   // Ee — wide spread — keep low
+      'viseme_O':   0.50,   // Oh — lip rounding
+      'viseme_U':   0.45,   // Oo — tight round
+    };
+
+    // Idle smile weight (very subtle viseme_I)
+    const IDLE_SMILE_WEIGHT = 0.015;
+
+    function resetAllVisemes() {
+      OCULUS_VISEMES.forEach(v => { targetWeights[v] = 0; });
+    }
+
+    function applySmoothedWeights() {
+      for (const name of OCULUS_VISEMES) {
+        currentWeights[name] += (targetWeights[name] - currentWeights[name]) * LERP_SPEED;
+        if (currentWeights[name] < 0.003) currentWeights[name] = 0;
+      }
+
+      // Idle smile: when not speaking, hold a very subtle viseme_I
+      if (!lipSyncActive) {
+        if (currentWeights['viseme_I'] < IDLE_SMILE_WEIGHT) {
+          currentWeights['viseme_I'] += (IDLE_SMILE_WEIGHT - currentWeights['viseme_I']) * 0.02;
+        }
+      }
+
+      // Calculate mouth openness for teeth visibility
+      const mouthOpen = (currentWeights['viseme_aa'] || 0) +
+                         (currentWeights['viseme_O'] || 0) +
+                         (currentWeights['viseme_E'] || 0) +
+                         (currentWeights['viseme_DD'] || 0);
+      const teethOpacity = Math.min(1.0, mouthOpen * 25); // ramp up quickly
+
+      for (const mesh of morphMeshes) {
+        if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) continue;
+        for (const name of OCULUS_VISEMES) {
+          const idx = mesh.morphTargetDictionary[name];
+          if (idx !== undefined) {
+            mesh.morphTargetInfluences[idx] = currentWeights[name];
+          }
+        }
+      }
+
+      // Update teeth opacity based on mouth openness
+      if (window._allSkinnedMeshes) {
+        for (const mesh of window._allSkinnedMeshes) {
+          if (mesh.name === 'Object_14' || mesh.name === 'Object_15') {
+            if (Array.isArray(mesh.material)) {
+              mesh.material.forEach(m => { m.opacity = teethOpacity; });
+            } else {
+              mesh.material.opacity = teethOpacity;
+            }
+          }
+        }
+      }
+    }
+
+    function setViseme(visemeName, weight) {
+      resetAllVisemes();
+      if (visemeName && visemeName !== 'viseme_sil') {
+        const cap = VISEME_MAX[visemeName] || 0.30;
+        targetWeights[visemeName] = Math.min(weight, cap);
+      }
+    }
+
+    // ─── Cue-based lip sync (Rhubarb) with per-viseme caps + smooth blending ───
+    function updateCueLipSync() {
+      if (!lipSyncActive || mouthCueQueue.length === 0) return;
+      const elapsed = (Date.now() - lipSyncStartTime) / 1000;
+
+      // Find current cue index
+      let cueIdx = -1;
+      for (let i = 0; i < mouthCueQueue.length; i++) {
+        if (elapsed >= mouthCueQueue[i].start && elapsed < mouthCueQueue[i].end) {
+          cueIdx = i;
+          break;
+        }
+      }
+
+      // Past the last cue — fade out
+      if (cueIdx === -1) {
+        if (elapsed >= mouthCueQueue[mouthCueQueue.length - 1].end) {
+          lipSyncActive = false;
+          resetAllVisemes();
+        }
+        return;
+      }
+
+      const cue = mouthCueQueue[cueIdx];
+      const cueDuration = cue.end - cue.start;
+      const cueProgress = (elapsed - cue.start) / cueDuration;
+
+      // Sustained envelope: fast attack, hold near peak, fast release.
+      // Keeps mouth shape visible for most of the cue duration.
+      let envelope;
+      if (cueProgress < 0.15) {
+        envelope = cueProgress / 0.15; // fast attack
+      } else if (cueProgress > 0.85) {
+        envelope = (1.0 - cueProgress) / 0.15; // fast release
+      } else {
+        envelope = 1.0; // sustain at full
+      }
+      const primaryViseme = RHUBARB_TO_OCULUS[cue.value] || 'viseme_sil';
+      const cap = VISEME_MAX[primaryViseme] || 0.30;
+      const primaryWeight = envelope * cap;
+
+      resetAllVisemes();
+
+      if (primaryViseme !== 'viseme_sil') {
+        targetWeights[primaryViseme] = primaryWeight;
+      }
+
+      // Co-articulation: blend in the next shape over the last 35%
+      if (cueProgress > 0.65 && cueIdx + 1 < mouthCueQueue.length) {
+        const nextCue = mouthCueQueue[cueIdx + 1];
+        const nextViseme = RHUBARB_TO_OCULUS[nextCue.value] || 'viseme_sil';
+        if (nextViseme !== 'viseme_sil' && nextViseme !== primaryViseme) {
+          const nextCap = VISEME_MAX[nextViseme] || 0.30;
+          const blendIn = (cueProgress - 0.65) / 0.35;
+          targetWeights[nextViseme] = blendIn * 0.5 * nextCap;
+        }
+      }
+
+      // Retain trace of previous shape over the first 25%
+      if (cueProgress < 0.25 && cueIdx > 0) {
+        const prevCue = mouthCueQueue[cueIdx - 1];
+        const prevViseme = RHUBARB_TO_OCULUS[prevCue.value] || 'viseme_sil';
+        if (prevViseme !== 'viseme_sil' && prevViseme !== primaryViseme) {
+          const prevCap = VISEME_MAX[prevViseme] || 0.30;
+          const fadeOut = 1.0 - (cueProgress / 0.25);
+          targetWeights[prevViseme] = fadeOut * 0.35 * prevCap;
+        }
+      }
+    }
+
+    function startLipSync(mouthCues) {
+      mouthCueQueue = mouthCues;
+      lipSyncStartTime = Date.now();
+      lipSyncActive = true;
+      console.log('[LipSync] Cue-based playback started with', mouthCues.length, 'cues');
+    }
+
+    // ─── Hand gesture system (bone-based) ───
+    function findBone(name) {
+      let found = null;
+      if (model) {
+        model.traverse((node) => {
+          if (node.isBone && node.name === name) found = node;
+        });
+      }
+      return found;
+    }
+
+    function initGestureBones() {
+      leftUpperArm = findBone('LeftArm_013');
+      rightUpperArm = findBone('RightArm_039');
+      leftForeArm = findBone('LeftForeArm_014');
+      rightForeArm = findBone('RightForeArm_040');
+      leftHand = findBone('LeftHand_017');
+      rightHand = findBone('RightHand_043');
+
+      // Find head/neck bones — try common naming patterns
+      const boneNames = [];
+      if (model) {
+        model.traverse(n => { if (n.isBone) boneNames.push(n.name); });
+        console.log('[Gesture] All bones:', boneNames.join(', '));
+      }
+      // Try to find head/neck by partial match
+      headBone = boneNames.find(n => /^Head/i.test(n)) ? findBone(boneNames.find(n => /^Head/i.test(n))) : null;
+      neckBone = boneNames.find(n => /^Neck/i.test(n)) ? findBone(boneNames.find(n => /^Neck/i.test(n))) : null;
+
+      // Save rest pose quaternions (arms + head + neck)
+      [leftUpperArm, rightUpperArm, leftForeArm, rightForeArm, leftHand, rightHand, headBone, neckBone].forEach(bone => {
+        if (bone) restPose[bone.name] = bone.quaternion.clone();
+      });
+
+      // Debug: log rest pose as Euler angles (degrees) so we know where arms start
+      const toDeg = r => (r * 180 / Math.PI).toFixed(1);
+      [rightUpperArm, rightForeArm, rightHand, leftUpperArm, leftForeArm, leftHand].forEach(bone => {
+        if (bone) {
+          const e = new THREE.Euler().setFromQuaternion(bone.quaternion);
+          console.log('[RestPose]', bone.name, 'Euler (deg): X=' + toDeg(e.x), 'Y=' + toDeg(e.y), 'Z=' + toDeg(e.z));
+        }
+      });
+
+      if (rightUpperArm) {
+        console.log('[Gesture] Arm bones found — hand gestures enabled');
+      }
+      if (headBone) {
+        console.log('[Gesture] Head bone found:', headBone.name, '— head nod enabled');
+      }
+      if (neckBone) {
+        console.log('[Gesture] Neck bone found:', neckBone.name);
+      }
+
+      // Pre-compute interlocked idle pose quaternions
+      const idleMap = [
+        [rightUpperArm, IDLE_POSE.rightUpper],
+        [rightForeArm,  IDLE_POSE.rightFore],
+        [rightHand,     IDLE_POSE.rightHand],
+        [leftUpperArm,  IDLE_POSE.leftUpper],
+        [leftForeArm,   IDLE_POSE.leftFore],
+        [leftHand,      IDLE_POSE.leftHand],
+      ];
+      idleMap.forEach(([bone, euler]) => {
+        if (bone && restPose[bone.name]) {
+          const q = restPose[bone.name].clone();
+          const g = new THREE.Quaternion().setFromEuler(new THREE.Euler(...euler));
+          idlePoseQuats[bone.name] = q.clone().multiply(g);
+        }
+      });
+      console.log('[Gesture] Interlocked idle pose computed');
+    }
+
+    // ─── Gesture library: 8 gesture types ───
+    // Each returns { right:{upper,fore,hand}, left:{upper,fore,hand} } Euler angles
+    // Forearm base bend = 0 (180° straight elbows). Each gesture defines its own bend.
+    // Axis map: Upper +X=down, -Z(R)/+Z(L)=forward. Fore -X=bend up, +X=drop.
+    // Rest is T-pose. Idle is arms at sides (upper X=1.36).
+    // Gestures should be SUBTLE — small lifts/movements near idle position.
+    const GESTURE_LIBRARY = [
+      // 0: Right hand explain — slight raise + small elbow bend
+      { name: 'right-explain', fn: (t, I) => ({
+        right: {
+          upper: [1.10, 0, -0.15 + Math.sin(t*1.4)*0.05],   // slightly raised from idle
+          fore:  [-0.25 + Math.sin(t*1.8)*0.08, 0, 0],        // gentle elbow bend
+          hand:  [Math.sin(t*1.2)*0.10, 0.08, 0]
+        }, left: null
+      })},
+      // 1: Left hand explain (mirror)
+      { name: 'left-explain', fn: (t, I) => ({
+        right: null,
+        left: {
+          upper: [1.10, 0, 0.15 + Math.sin(t*1.3+0.5)*0.05],
+          fore:  [-0.25 + Math.sin(t*1.7+0.3)*0.08, 0, 0],
+          hand:  [Math.sin(t*1.1+0.4)*0.10, -0.08, 0]
+        }
+      })},
+      // 2: Both hands open / welcoming — subtle outward
+      { name: 'both-open', fn: (t, I) => ({
+        right: {
+          upper: [1.15, 0, -0.10 + Math.sin(t*1.0)*0.04],
+          fore:  [-0.20, 0, 0],
+          hand:  [0, 0.10, Math.sin(t*1.3)*0.06]
+        },
+        left: {
+          upper: [1.15, 0, 0.10 + Math.sin(t*1.0+0.3)*0.04],
+          fore:  [-0.20, 0, 0],
+          hand:  [0, -0.10, Math.sin(t*1.3+0.3)*0.06]
+        }
+      })},
+      // 3: Right hand emphasis — small pump
+      { name: 'right-emphasis', fn: (t, I) => ({
+        right: {
+          upper: [1.15, 0, -0.12],
+          fore:  [-0.30 + Math.sin(t*2.2)*0.10, 0, 0],
+          hand:  [Math.sin(t*2.5)*0.12, 0.05, 0]
+        }, left: null
+      })},
+      // 4: Left hand enumerate
+      { name: 'left-enumerate', fn: (t, I) => ({
+        right: null,
+        left: {
+          upper: [1.15, 0, 0.12],
+          fore:  [-0.25, 0, 0],
+          hand:  [Math.sin(t*2.0)*0.10 + 0.05, -0.06, 0]
+        }
+      })},
+      // 5: Both hands steeple / thoughtful — hands come slightly forward
+      { name: 'steeple', fn: (t, I) => ({
+        right: {
+          upper: [1.20, 0, -0.20],
+          fore:  [-0.30 + Math.sin(t*1.5)*0.04, 0, 0],
+          hand:  [0, 0.12, 0]
+        },
+        left: {
+          upper: [1.20, 0, 0.20],
+          fore:  [-0.30 + Math.sin(t*1.5+0.2)*0.04, 0, 0],
+          hand:  [0, -0.12, 0]
+        }
+      })},
+      // 6: Right hand illustrate — moderate movement
+      { name: 'right-illustrate', fn: (t, I) => ({
+        right: {
+          upper: [1.05, 0, -0.18 + Math.sin(t*1.1)*0.06],
+          fore:  [-0.25 + Math.sin(t*1.6)*0.08, 0, 0],
+          hand:  [Math.sin(t*2.0)*0.12, Math.cos(t*1.4)*0.08, 0]
+        }, left: null
+      })},
+      // 7: Both hands calm / reassure — palms slightly out
+      { name: 'calm-reassure', fn: (t, I) => ({
+        right: {
+          upper: [1.25, 0, -0.10 + Math.sin(t*0.8)*0.03],
+          fore:  [-0.15, 0, 0],
+          hand:  [-0.10, 0, Math.sin(t*0.8)*0.05]
+        },
+        left: {
+          upper: [1.25, 0, 0.10 + Math.sin(t*0.8+0.5)*0.03],
+          fore:  [-0.15, 0, 0],
+          hand:  [-0.10, 0, Math.sin(t*0.8+0.5)*0.05]
+        }
+      })}
+    ];
+
+    // Wave gesture — right hand waves hello (used on first response)
+
+    function getWavePose(t, I) {
+      // From T-pose rest. Axis: upper +X=down, -Z=forward. Fore -X=bend up.
+      // Wave: keep arm at shoulder height, slight forward, elbow 90° up, hand waves
+      return {
+        right: {
+          upper: [-0.15, 0, -0.25],               // slight raise + slight forward
+          fore:  [-1.57, 1.57, 0],                 // 90° elbow bend + 90° forearm roll (palm forward)
+          hand:  [Math.sin(t*3.0*2*Math.PI)*0.40, 0, 0]  // wave on X axis
+        },
+        left: null
+      };
+    }
+
+    // ─── Debug: Test individual bone axes ───
+    // Call from console: testBoneAxis('upper', 'x', 0.5)
+    // This sets ONE axis on ONE bone to see what real-world motion it produces
+    let _testMode = false;
+    window.testBoneAxis = function(part, axis, radians) {
+      _testMode = true; // Prevent idle from overwriting
+      gestureActive = false; // Stop any active gesture
+      const bone = part === 'upper' ? rightUpperArm :
+                   part === 'fore' ? rightForeArm :
+                   part === 'hand' ? rightHand : null;
+      if (!bone || !restPose[bone.name]) { console.log('Bone not found:', part); return; }
+      // First reset all arm bones to rest
+      [rightUpperArm, rightForeArm, rightHand].forEach(b => {
+        if (b && restPose[b.name]) b.quaternion.copy(restPose[b.name]);
+      });
+      const e = [0, 0, 0];
+      const idx = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+      e[idx] = radians;
+      const q = restPose[bone.name].clone();
+      const g = new THREE.Quaternion().setFromEuler(new THREE.Euler(...e));
+      bone.quaternion.copy(q).multiply(g);
+      console.log('[TEST]', part, axis, '=', (radians*180/Math.PI).toFixed(1) + '°', '— HOLDING (idle disabled)');
+    };
+    // Reset to rest: window.resetArm()
+    window.resetArm = function() {
+      _testMode = false;
+      [rightUpperArm, rightForeArm, rightHand].forEach(b => {
+        if (b && restPose[b.name]) b.quaternion.copy(restPose[b.name]);
+      });
+      console.log('[TEST] Arm reset to rest pose, idle re-enabled');
+    };
+    // Force wave now: window.forceWave()
+    window.forceWave = function() {
+      _testMode = false;
+      isFirstResponse = true;
+      startGesture(3);
+      console.log('[TEST] Forced wave gesture');
+    };
+
+    // ─── Temi Integration: JavaScript bridge for Android WebView ───
+    // Kotlin calls: webView.evaluateJavascript("TemiInterface.playAudio('data:audio/mpeg;base64,...', [])", null)
+    window.TemiInterface = {
+      /**
+       * Play audio with lip sync in the avatar.
+       * @param {string} audioDataUri - data URI (data:audio/mpeg;base64,...)
+       * @param {Array} mouthCues - [{start, end, value}, ...] from Rhubarb (optional)
+       */
+      playAudio: function(audioDataUri, mouthCues) {
+        console.log('[Temi] playAudio called, cues:', mouthCues?.length || 0);
+        window.postMessage({
+          type: 'playAudioWithLipSync',
+          audioUrl: audioDataUri,
+          _mouthCues: mouthCues || []
+        }, '*');
+      },
+
+      /**
+       * Play audio with lip sync using the /api/chat/animate endpoint.
+       * Sends base64 audio to backend, gets cues, then plays.
+       * @param {string} audioBase64 - raw base64 audio (no data: prefix)
+       * @param {string} mimeType - "audio/mpeg" or "audio/wav"
+       * @param {string} text - optional transcript for better lip sync
+       * @param {string} backendUrl - backend URL (default http://localhost:8000)
+       */
+      playAudioWithBackend: async function(audioBase64, mimeType, text, backendUrl) {
+        const url = (backendUrl || 'http://localhost:8000') + '/api/chat/animate';
+        try {
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              audio_base64: audioBase64,
+              mime_type: mimeType || 'audio/mpeg',
+              text: text || ''
+            })
+          });
+          const data = await resp.json();
+          if (data.status === 'success') {
+            this.playAudio(data.audio_data, data.mouth_cues);
+          } else {
+            console.error('[Temi] animate failed:', data);
+          }
+        } catch (err) {
+          console.error('[Temi] Backend call failed:', err);
+          // Fallback: play audio without lip sync
+          this.playAudio('data:' + (mimeType || 'audio/mpeg') + ';base64,' + audioBase64, []);
+        }
+      },
+
+      /** Stop current speech and gestures */
+      stop: function() {
+        stopGestures();
+        if (typeof resetAllVisemes === 'function') resetAllVisemes();
+        window.parent.postMessage({ type: 'audioEnded' }, '*');
+        console.log('[Temi] Stopped');
+      },
+
+      /** Trigger wave gesture */
+      wave: function() {
+        isFirstResponse = true;
+        startGesture(3);
+      },
+
+      /** Check if avatar is ready */
+      isReady: function() {
+        return !!model;
+      },
+
+      /** Get avatar status */
+      getStatus: function() {
+        return {
+          ready: !!model,
+          speaking: headAudioSpeaking || lipSyncActive,
+          gesturing: gestureActive,
+          headAudioReady: headAudioReady
+        };
+      }
+    };
+    console.log('[Temi] TemiInterface bridge ready');
+
+    function buildGestureQueue(totalDurationSec) {
+      // Split speech into 1.8–3.5s gesture segments with short pauses
+      const queue = [];
+      let cursor = 0;
+      const totalMs = totalDurationSec * 1000;
+      let lastType = -1;
+
+      while (cursor < totalMs - 500) {
+        const segLen = (1800 + Math.random() * 1700); // 1.8–3.5s per gesture
+        const pauseLen = (200 + Math.random() * 400);  // 0.2–0.6s pause between
+        const end = Math.min(cursor + segLen, totalMs);
+
+        // Pick a different gesture type than the last one
+        let gType;
+        do { gType = Math.floor(Math.random() * GESTURE_LIBRARY.length); }
+        while (gType === lastType && GESTURE_LIBRARY.length > 1);
+        lastType = gType;
+
+        queue.push({ start: cursor, end: end, type: gType });
+        cursor = end + pauseLen;
+      }
+      return queue;
+    }
+
+    function startGesture(speechDuration) {
+      if (!rightUpperArm) return;
+
+      if (isFirstResponse) {
+        // First response: wave hello first, then normal gestures
+        isFirstResponse = false;
+        const waveLen = 2000; // 2s wave
+        gestureQueue = [{ start: 0, end: waveLen, type: -1 }];
+        // Append normal gestures for remaining speech time
+        const remainingMs = Math.max(speechDuration * 1000 - waveLen - 200, 500);
+        const normalQueue = buildGestureQueue(remainingMs / 1000);
+        normalQueue.forEach(seg => {
+          seg.start += waveLen + 200;
+          seg.end += waveLen + 200;
+        });
+        gestureQueue = gestureQueue.concat(normalQueue);
+        speechEndTime = speechDuration * 1000; // NO extension — match actual speech
+        console.log('[Gesture] First response — wave + chain:', gestureQueue.length, 'segments, duration:', speechDuration.toFixed(1) + 's');
+      } else {
+        gestureQueue = buildGestureQueue(speechDuration);
+        speechEndTime = speechDuration * 1000;
+        console.log('[Gesture] Chain started:', gestureQueue.length, 'segments over', speechDuration.toFixed(1) + 's');
+      }
+
+      gestureChainIndex = 0;
+      gestureActive = true;
+      gestureStartTime = Date.now();
+    }
+
+    function applyArmPose(upperBone, foreBone, handBone, eulers, blendFactor) {
+      if (!eulers) return;
+      const applyBone = (bone, euler) => {
+        if (!bone || !restPose[bone.name]) return;
+        const idle = idlePoseQuats[bone.name] || restPose[bone.name];
+        const rest = restPose[bone.name].clone();
+        const g = new THREE.Quaternion().setFromEuler(new THREE.Euler(...euler));
+        const target = rest.clone().multiply(g);
+        // Blend from idle toward gesture target
+        bone.quaternion.copy(idle.clone()).slerp(target, blendFactor);
+      };
+      applyBone(upperBone, eulers.upper);
+      applyBone(foreBone, eulers.fore);
+      applyBone(handBone, eulers.hand);
+    }
+
+    function slerpToRest(bone, factor) {
+      if (bone && restPose[bone.name]) {
+        bone.quaternion.slerp(restPose[bone.name], factor);
+      }
+    }
+
+    // Slerp toward interlocked idle pose instead of rest
+    function slerpToIdle(bone, factor) {
+      if (bone && idlePoseQuats[bone.name]) {
+        bone.quaternion.slerp(idlePoseQuats[bone.name], factor);
+      } else if (bone && restPose[bone.name]) {
+        bone.quaternion.slerp(restPose[bone.name], factor);
+      }
+    }
+
+    // Stop all gestures immediately
+    function stopGestures() {
+      gestureActive = false;
+      gestureQueue = [];
+      console.log('[Gesture] Stopped');
+    }
+
+    function updateGestures() {
+      if (!gestureActive || !rightUpperArm) return;
+
+      const elapsed = Date.now() - gestureStartTime;
+
+      // Check if speech is over
+      if (elapsed >= speechEndTime) {
+        gestureActive = false;
+        return;
+      }
+
+      // ── Head nod during speech (independent of arm gestures) ──
+      if (headBone && restPose[headBone.name]) {
+        const ht = elapsed / 1000;
+        // Gentle nod (pitch) + very subtle tilt (roll) — conversational
+        const nodX = Math.sin(ht * 1.8) * 0.06 + Math.sin(ht * 0.7) * 0.03; // ~5° nod
+        const tiltZ = Math.sin(ht * 0.9 + 0.5) * 0.025; // ~1.5° tilt
+        const hq = restPose[headBone.name].clone();
+        const hg = new THREE.Quaternion().setFromEuler(new THREE.Euler(nodX, 0, tiltZ));
+        headBone.quaternion.copy(hq).multiply(hg);
+      }
+      if (neckBone && restPose[neckBone.name]) {
+        const ht = elapsed / 1000;
+        // Neck follows head at ~40% intensity, slightly delayed
+        const neckX = Math.sin(ht * 1.8 - 0.15) * 0.025;
+        const nq = restPose[neckBone.name].clone();
+        const ng = new THREE.Quaternion().setFromEuler(new THREE.Euler(neckX, 0, 0));
+        neckBone.quaternion.copy(nq).multiply(ng);
+      }
+
+      // Find current gesture segment
+      let seg = null;
+      for (let i = 0; i < gestureQueue.length; i++) {
+        if (elapsed >= gestureQueue[i].start && elapsed < gestureQueue[i].end) {
+          seg = gestureQueue[i];
+          break;
+        }
+      }
+
+      if (!seg) {
+        // In a pause between gestures — ease arms toward interlocked pose
+        slerpToIdle(rightUpperArm, 0.08);
+        slerpToIdle(rightForeArm, 0.08);
+        slerpToIdle(rightHand, 0.08);
+        slerpToIdle(leftUpperArm, 0.08);
+        slerpToIdle(leftForeArm, 0.08);
+        slerpToIdle(leftHand, 0.08);
+        return;
+      }
+
+      const segElapsed = elapsed - seg.start;
+      const segDuration = seg.end - seg.start;
+      const segProgress = segElapsed / segDuration;
+
+      // Envelope per segment: smoothstep in/out
+      let envelope;
+      if (segProgress < 0.15) {
+        const x = segProgress / 0.15;
+        envelope = x * x * (3 - 2 * x);
+      } else if (segProgress > 0.80) {
+        const x = (1.0 - segProgress) / 0.20;
+        envelope = x * x * (3 - 2 * x);
+      } else {
+        envelope = 1.0;
+      }
+
+      // Rhythmic emphasis layered on top
+      const rhythm = Math.sin(segElapsed / 350) * 0.25 + 0.75;
+      const intensity = envelope * rhythm;
+
+      const t = segElapsed / 1000;
+
+      // Handle wave gesture (type -1) vs library gestures
+      // Pass I=1 for full-strength target; intensity used as blend factor
+      let poses;
+      if (seg.type === -1) {
+        poses = getWavePose(t, 1.0);
+      } else {
+        const gestureDef = GESTURE_LIBRARY[seg.type];
+        poses = gestureDef.fn(t, 1.0);
+      }
+
+      // Apply right arm (blend from idle to gesture by intensity)
+      if (poses.right) {
+        applyArmPose(rightUpperArm, rightForeArm, rightHand, poses.right, intensity);
+      } else {
+        slerpToIdle(rightUpperArm, 0.08);
+        slerpToIdle(rightForeArm, 0.08);
+        slerpToIdle(rightHand, 0.08);
+      }
+
+      // Apply left arm
+      if (poses.left) {
+        applyArmPose(leftUpperArm, leftForeArm, leftHand, poses.left, intensity);
+      } else {
+        slerpToIdle(leftUpperArm, 0.08);
+        slerpToIdle(leftForeArm, 0.08);
+        slerpToIdle(leftHand, 0.08);
+      }
+    }
+
+    // Idle: return to interlocked fingers pose when not speaking
+    function updateIdleGesture() {
+      if (gestureActive || _testMode || !rightUpperArm) return;
+      [leftUpperArm, rightUpperArm, leftForeArm, rightForeArm, leftHand, rightHand].forEach(bone => {
+        slerpToIdle(bone, 0.08); // smooth return to clasped hands
+      });
+      // Head/neck return to rest (no idle tilt)
+      slerpToRest(headBone, 0.08);
+      slerpToRest(neckBone, 0.08);
+    }
+
+    // ─── Load avatar ───
+    const loader = new GLTFLoader();
+    loader.load('/indian_doctor_lipsync.glb',
+      (gltf) => {
+        model = gltf.scene;
+        model.position.set(0, 0, 0);
+        model.rotation.set(0, 0, 0);
+        model.scale.set(1, 1, 1);
+
+        let allSkinnedMeshes = [];
+
+        model.traverse((node) => {
+          if (node.isMesh) {
+            if (node.isSkinnedMesh) {
+              node.visible = true;
+              node.frustumCulled = false;
+              allSkinnedMeshes.push(node);
+
+              // ── Teeth & face material fixes ──
+              // Object_9 = face mesh: use FrontSide so inner mouth backfaces
+              // are transparent, revealing teeth behind the lip gap
+              if (node.name === 'Object_9') {
+                if (Array.isArray(node.material)) {
+                  node.material.forEach(m => { m.side = THREE.FrontSide; });
+                } else {
+                  node.material.side = THREE.FrontSide;
+                }
+              }
+
+              // Object_14 = lower teeth, Object_15 = upper teeth
+              // Render inside mouth but reduce opacity when mouth nearly closed
+              if (node.name === 'Object_14' || node.name === 'Object_15') {
+                if (Array.isArray(node.material)) {
+                  node.material.forEach(m => {
+                    m.side = THREE.DoubleSide;
+                    m.depthWrite = true;
+                    m.transparent = true;
+                    m.opacity = 0.0; // Start hidden; lip sync will reveal
+                  });
+                } else {
+                  node.material.side = THREE.DoubleSide;
+                  node.material.depthWrite = true;
+                  node.material.transparent = true;
+                  node.material.opacity = 0.0;
+                }
+                console.log('[AvatarView] Teeth mesh fixed:', node.name);
+              }
+
+              const hasMorphDict = node.morphTargetDictionary && Object.keys(node.morphTargetDictionary).length > 0;
+              if (hasMorphDict) {
+                morphMeshes.push(node);
+                // Use the mesh with most morph-affected verts as the primary
+                if (!headMesh || node.geometry.getAttribute('position').count > headMesh.geometry.getAttribute('position').count) {
+                  headMesh = node;
+                  morphTargetMap = { ...node.morphTargetDictionary };
+                }
+                console.log('[AvatarView] Morph mesh:', node.name,
+                  'verts:', node.geometry.getAttribute('position').count,
+                  'visemes:', Object.keys(node.morphTargetDictionary));
+              }
+              console.log('[AvatarView] SkinnedMesh:', node.name,
+                'verts:', node.geometry.getAttribute('position')?.count,
+                'hasMorph:', hasMorphDict);
+            } else {
+              node.visible = false;
+            }
+          }
+        });
+
+        console.log('[AvatarView] Total morph meshes:', morphMeshes.length,
+          morphMeshes.map(m => m.name));
+
+        // Log all skinned meshes for debugging overlap issues
+        console.log('[AvatarView] All skinned meshes:', allSkinnedMeshes.map(m => m.name));
+
+        // Expose for debug panel
+        window._allSkinnedMeshes = allSkinnedMeshes;
+
+        scene.add(model);
+
+        if (gltf.animations.length > 0) {
+          mixer = new THREE.AnimationMixer(model);
+          const action = mixer.clipAction(gltf.animations[0]);
+
+          // Remove tracks that target arm/hand/head/neck bones
+          // so the mixer doesn't override our gesture system
+          const clip = action.getClip();
+          const bonesToExclude = [
+            'LeftArm_013', 'RightArm_039',
+            'LeftForeArm_014', 'RightForeArm_040',
+            'LeftHand_017', 'RightHand_043',
+          ];
+          // Also exclude Head/Neck if present
+          const tracksToKeep = clip.tracks.filter(track => {
+            return !bonesToExclude.some(boneName => track.name.includes(boneName)) &&
+                   !/Head|Neck/i.test(track.name);
+          });
+          const filteredClip = new THREE.AnimationClip(clip.name, clip.duration, tracksToKeep);
+          console.log('[Anim] Original tracks:', clip.tracks.length,
+            'Filtered:', tracksToKeep.length,
+            'Removed:', clip.tracks.length - tracksToKeep.length,
+            'Excluded bones:', clip.tracks.filter(t => !tracksToKeep.includes(t)).map(t => t.name));
+
+          // Play the filtered animation
+          const filteredAction = mixer.clipAction(filteredClip);
+          filteredAction.play();
+          mixer.update(0);
+        }
+
+        model.updateMatrixWorld(true);
+
+        // Compute bounding box for camera framing
+        const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+        const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+        const v = new THREE.Vector3();
+        model.traverse((node) => {
+          if (node.isSkinnedMesh && node.visible && node.geometry) {
+            const posAttr = node.geometry.getAttribute('position');
+            if (!posAttr) return;
+            for (let i = 0; i < posAttr.count; i++) {
+              v.fromBufferAttribute(posAttr, i);
+              v.applyMatrix4(node.matrixWorld);
+              min.min(v); max.max(v);
+            }
+          }
+        });
+
+        const size = new THREE.Vector3().subVectors(max, min);
+        const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
+
+        // Waist-to-head framing
+        const lookY = min.y + size.y * 0.43;
+        const dist = size.y * 0.55;
+        camera.position.set(center.x, lookY, center.z + dist);
+        camera.lookAt(center.x, lookY, center.z);
+
+        console.log('[AvatarView] Camera ready. morphTargets:', Object.keys(morphTargetMap).length);
+
+        // Detailed morph target diagnostics
+        if (headMesh) {
+          console.log('[AvatarView] headMesh name:', headMesh.name);
+          console.log('[AvatarView] morphTargetDictionary:', JSON.stringify(headMesh.morphTargetDictionary));
+          console.log('[AvatarView] morphTargetInfluences:', headMesh.morphTargetInfluences);
+          const morphPos = headMesh.geometry.morphAttributes.position;
+          if (morphPos) {
+            console.log('[AvatarView] morphAttributes.position count:', morphPos.length);
+            morphPos.forEach((attr, i) => {
+              let maxD = 0, nonZero = 0;
+              for (let j = 0; j < attr.count; j++) {
+                const dy = attr.getY(j);
+                const d = Math.sqrt(attr.getX(j)**2 + dy**2 + attr.getZ(j)**2);
+                if (d > maxD) maxD = d;
+                if (Math.abs(dy) > 0.001) nonZero++;
+              }
+              const name = Object.entries(headMesh.morphTargetDictionary).find(([k,v]) => v === i)?.[0] || '?';
+              console.log(`  [${i}] ${name}: maxDisp=${maxD.toFixed(5)}, nonZeroY=${nonZero}/${attr.count}`);
+            });
+          } else {
+            console.error('[AvatarView] NO morphAttributes.position! Morph targets will NOT work.');
+          }
+        } else {
+          console.error('[AvatarView] NO headMesh found! No mesh has morphTargetDictionary.');
+        }
+
+        // Initialize HeadAudio after avatar is loaded
+        initHeadAudio();
+        // Initialize gesture bones
+        initGestureBones();
+      },
+      undefined,
+      (err) => console.error('[AvatarView] Error:', err)
+    );
+
+    // ─── Animation loop ───
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      if (mixer) mixer.update(dt);
+      // Only run cue-based lip sync when HeadAudio isn't actively driving
+      if (!headAudioSpeaking) {
+        updateCueLipSync();
+      }
+      applySmoothedWeights();
+      updateGestures();
+      updateIdleGesture();
+      if (headAudio && headAudioReady) {
+        headAudio.update(dt * 1000);
+      }
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ─── Message handler for lip sync + speaking ───
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (!data || !model) return;
+
+      // Audio-driven lip sync via HeadAudio (PRIMARY — real-time)
+      if (data.type === 'playAudioWithLipSync' && data.audioUrl) {
+        // Always start gestures regardless of HeadAudio success
+        const cues = data._mouthCues;
+        const speechDuration = cues && cues.length > 0 ? cues[cues.length - 1].end : 5;
+        startGesture(speechDuration);
+
+        connectAudioToHeadAudio(data.audioUrl).then(success => {
+          if (!success) {
+            // HeadAudio failed — fall back to cue-based lip sync + <audio> playback
+            if (cues) startLipSync(cues);
+            // Play audio via a temporary Audio element since HeadAudio can't
+            try {
+              const fallbackAudio = new Audio(data.audioUrl);
+              fallbackAudio.onended = () => {
+                stopGestures();
+                lipSyncActive = false;
+                resetAllVisemes();
+                window.parent.postMessage({ type: 'audioEnded' }, '*');
+              };
+              fallbackAudio.play().catch(() => {});
+            } catch(e) {}
+          }
+        });
+      }
+
+      // Cue-based lip sync — fallback only when HeadAudio isn't driving
+      if (data.type === 'lipSync' && data.mouthCues) {
+        if (!headAudioSpeaking) {
+          startLipSync(data.mouthCues);
+        }
+      }
+
+      // Simple head bob (fallback)
+      if (data.type === 'avatarSpeak') {
+        const duration = data.duration || 2000;
+        const startTime = Date.now();
+        const origY = model.position.y;
+        const anim = () => {
+          const elapsed = Date.now() - startTime;
+          if (elapsed < duration) {
+            const t = elapsed / 200;
+            model.position.y = origY + Math.sin(t * Math.PI * 2) * 0.02;
+            model.rotation.z = Math.sin(t) * 0.01;
+            requestAnimationFrame(anim);
+          } else {
+            model.position.y = origY;
+            model.rotation.z = 0;
+          }
+        };
+        anim();
+      }
+
+      // Test: set a single viseme directly (smoothed, capped)
+      if (data.type === 'testViseme' && data.viseme) {
+        const visemeName = RHUBARB_TO_OCULUS[data.viseme] || data.viseme;
+        const cap = VISEME_MAX[visemeName] || 0.15;
+        setViseme(visemeName, cap);
+        console.log('[LipSync] Test viseme:', visemeName, 'cap:', cap);
+      }
+
+      // Test: play a demo lip sync sequence using Oculus visemes
+      if (data.type === 'testLipSync') {
+        const demoCues = [
+          { start: 0.00, end: 0.12, value: 'X' },  // silence
+          { start: 0.12, end: 0.28, value: 'A' },  // PP (m)
+          { start: 0.28, end: 0.44, value: 'D' },  // aa (ah)
+          { start: 0.44, end: 0.58, value: 'B' },  // I (ee)
+          { start: 0.58, end: 0.74, value: 'C' },  // E (eh)
+          { start: 0.74, end: 0.90, value: 'E' },  // O (oh)
+          { start: 0.90, end: 1.06, value: 'F' },  // U (oo)
+          { start: 1.06, end: 1.22, value: 'G' },  // FF (f/v)
+          { start: 1.22, end: 1.38, value: 'H' },  // TH
+          { start: 1.38, end: 1.54, value: 'D' },  // aa
+          { start: 1.54, end: 1.70, value: 'B' },  // I
+          { start: 1.70, end: 1.86, value: 'E' },  // O
+          { start: 1.86, end: 2.02, value: 'A' },  // PP
+          { start: 2.02, end: 2.20, value: 'X' },  // silence
+        ];
+        startLipSync(demoCues);
+      }
+    });
+
+    // ─── Direct debug controls (visible in standalone mode) ───
+    function createDebugPanel() {
+      const panel = document.createElement('div');
+      panel.id = 'debug-panel';
+      panel.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:rgba(0,0,0,0.92);padding:10px;z-index:9999;font-family:monospace;font-size:12px;color:#fff;';
+
+      const info = document.createElement('div');
+      info.id = 'debug-info';
+      info.style.cssText = 'margin-bottom:8px;color:#0f0;white-space:pre;max-height:250px;overflow-y:auto;';
+      panel.appendChild(info);
+
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;align-items:center;';
+
+      // ═══════════════════════════════════════════════════════
+      // 1. MORPH SLIDER — Test viseme_aa morph target (0 to 3x)
+      //    This tests the BLENDER morph targets, not JS vertex moves
+      // ═══════════════════════════════════════════════════════
+      const sliderLabel = document.createElement('span');
+      sliderLabel.textContent = 'viseme_aa: 0.0';
+      sliderLabel.style.cssText = 'color:#ff0;font-weight:bold;min-width:100px;';
+      row.appendChild(sliderLabel);
+
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.min = '0';
+      slider.max = '300';
+      slider.value = '0';
+      slider.style.cssText = 'width:180px;';
+      slider.oninput = () => {
+        const val = slider.value / 100;
+        sliderLabel.textContent = `viseme_aa: ${val.toFixed(1)}`;
+        for (const mesh of morphMeshes) {
+          if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) continue;
+          // Reset all
+          for (let i = 0; i < mesh.morphTargetInfluences.length; i++) {
+            mesh.morphTargetInfluences[i] = 0;
+          }
+          const idx = mesh.morphTargetDictionary['viseme_aa'];
+          if (idx !== undefined) {
+            mesh.morphTargetInfluences[idx] = val;
+            if (val > 0 && !info.textContent.startsWith('MORPH')) {
+              info.textContent = `MORPH active: ${mesh.name} viseme_aa idx=${idx} weight=${val}`;
+            }
+          }
+        }
+      };
+      row.appendChild(slider);
+
+      // ═══════════════════════════════════════════════════════
+      // 2. DUMP Y — Show ACTUAL vertex Y distribution in mouth area
+      // ═══════════════════════════════════════════════════════
+      const dumpBtn = document.createElement('button');
+      dumpBtn.textContent = 'DUMP Y';
+      dumpBtn.style.cssText = 'padding:8px 12px;border:none;border-radius:4px;background:#4361ee;color:#fff;cursor:pointer;font-size:13px;font-weight:bold;';
+      dumpBtn.onclick = () => {
+        const mesh = (window._allSkinnedMeshes || []).find(m => m.name === 'Object_9');
+        if (!mesh) { info.textContent = 'Object_9 not found'; return; }
+        const posAttr = mesh.geometry.getAttribute('position');
+
+        // Get ALL front-face verts near mouth height (wide range)
+        let verts = [];
+        for (let i = 0; i < posAttr.count; i++) {
+          const x = posAttr.getX(i);
+          const y = posAttr.getY(i);
+          const z = posAttr.getZ(i);
+          // Wide mouth area: front face, center strip
+          if (Math.abs(x) < 0.04 && z > 0.06 && y > 2.75 && y < 2.95) {
+            verts.push({ i, x, y, z });
+          }
+        }
+        verts.sort((a, b) => a.y - b.y);
+
+        // Y histogram with 0.005 bins
+        const bins = {};
+        for (const v of verts) {
+          const bin = (Math.round(v.y * 200) / 200).toFixed(3);
+          bins[bin] = (bins[bin] || 0) + 1;
+        }
+
+        let msg = `Object_9 center-strip Y histogram (|x|<0.04, z>0.06)\n`;
+        msg += `Total: ${verts.length} verts\n\n`;
+        msg += `Y bin     Count  Visual\n`;
+        Object.keys(bins).sort().forEach(k => {
+          const bar = '█'.repeat(Math.min(40, bins[k]));
+          msg += `${k}  ${String(bins[k]).padStart(4)}  ${bar}\n`;
+        });
+
+        // Also show the 10 lowest and 10 highest Y verts
+        msg += `\nLowest 10 Y:\n`;
+        verts.slice(0, 10).forEach(v => {
+          msg += `  vi=${v.i} Y=${v.y.toFixed(4)} Z=${v.z.toFixed(4)}\n`;
+        });
+        msg += `\nHighest 10 Y:\n`;
+        verts.slice(-10).forEach(v => {
+          msg += `  vi=${v.i} Y=${v.y.toFixed(4)} Z=${v.z.toFixed(4)}\n`;
+        });
+
+        // Check morph target data for viseme_aa
+        const morphPos = mesh.geometry.morphAttributes.position;
+        if (morphPos && mesh.morphTargetDictionary) {
+          const aaIdx = mesh.morphTargetDictionary['viseme_aa'];
+          if (aaIdx !== undefined && morphPos[aaIdx]) {
+            const aaAttr = morphPos[aaIdx];
+            msg += `\nviseme_aa morph deltas (center-strip mouth verts):\n`;
+            let hasDown = 0, hasUp = 0;
+            for (const v of verts.slice(0, 20)) {
+              const dy = aaAttr.getY(v.i);
+              const dx = aaAttr.getX(v.i);
+              const dz = aaAttr.getZ(v.i);
+              const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+              if (dy < -0.001) hasDown++;
+              if (dy > 0.001) hasUp++;
+              if (d > 0.001) {
+                msg += `  vi=${v.i} baseY=${v.y.toFixed(4)} delta: dX=${dx.toFixed(4)} dY=${dy.toFixed(4)} dZ=${dz.toFixed(4)}\n`;
+              }
+            }
+            msg += `\nDown deltas: ${hasDown}, Up deltas: ${hasUp}\n`;
+          }
+        } else {
+          msg += `\nNO morph attributes found!\n`;
+        }
+
+        info.textContent = msg;
+        console.log('[DUMP Y]', msg);
+      };
+      row.appendChild(dumpBtn);
+
+      // ═══════════════════════════════════════════════════════
+      // 3. MORPH INFO — Show all morph targets and their stats
+      // ═══════════════════════════════════════════════════════
+      const morphInfoBtn = document.createElement('button');
+      morphInfoBtn.textContent = 'MORPH INFO';
+      morphInfoBtn.style.cssText = 'padding:8px 12px;border:none;border-radius:4px;background:#7b2cbf;color:#fff;cursor:pointer;font-size:13px;font-weight:bold;';
+      morphInfoBtn.onclick = () => {
+        let msg = '=== MORPH TARGET INFO ===\n\n';
+        msg += `morphMeshes: ${morphMeshes.length} [${morphMeshes.map(m=>m.name).join(', ')}]\n\n`;
+
+        for (const mesh of morphMeshes) {
+          msg += `${mesh.name} (${mesh.geometry.getAttribute('position').count} verts):\n`;
+          msg += `  Dictionary: ${JSON.stringify(mesh.morphTargetDictionary)}\n`;
+          msg += `  Influences: [${mesh.morphTargetInfluences?.map(v=>v.toFixed(2)).join(', ')}]\n`;
+
+          const morphPos = mesh.geometry.morphAttributes.position;
+          if (morphPos) {
+            msg += `  Morph attrs: ${morphPos.length} targets\n`;
+            for (let ti = 0; ti < morphPos.length; ti++) {
+              const attr = morphPos[ti];
+              let maxD = 0, nonZero = 0, maxDy = 0;
+              for (let j = 0; j < attr.count; j++) {
+                const dx = attr.getX(j), dy = attr.getY(j), dz = attr.getZ(j);
+                const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                if (d > maxD) maxD = d;
+                if (Math.abs(dy) > maxDy) maxDy = Math.abs(dy);
+                if (d > 0.001) nonZero++;
+              }
+              const name = Object.entries(mesh.morphTargetDictionary).find(([k,v]) => v === ti)?.[0] || '?';
+              msg += `    [${ti}] ${name}: maxDisp=${maxD.toFixed(4)}, maxDY=${maxDy.toFixed(4)}, nonZero=${nonZero}\n`;
+            }
+          } else {
+            msg += `  NO morphAttributes.position!\n`;
+          }
+          msg += '\n';
+        }
+
+        // List ALL skinned meshes
+        msg += `=== ALL SKINNED MESHES ===\n`;
+        for (const mesh of window._allSkinnedMeshes || []) {
+          msg += `${mesh.name}: ${mesh.geometry.getAttribute('position').count} verts, visible=${mesh.visible}\n`;
+        }
+
+        info.textContent = msg;
+        console.log('[MORPH INFO]', msg);
+      };
+      row.appendChild(morphInfoBtn);
+
+      // ═══════════════════════════════════════════════════════
+      // 4. RESET
+      // ═══════════════════════════════════════════════════════
+      const resetBtn = document.createElement('button');
+      resetBtn.textContent = 'RESET';
+      resetBtn.style.cssText = 'padding:8px 12px;border:none;border-radius:4px;background:#555;color:#fff;cursor:pointer;font-size:13px;';
+      resetBtn.onclick = () => {
+        slider.value = '0';
+        sliderLabel.textContent = 'viseme_aa: 0.0';
+        for (const mesh of window._allSkinnedMeshes || []) {
+          if (mesh.userData._origPos) {
+            const posAttr = mesh.geometry.getAttribute('position');
+            posAttr.array.set(mesh.userData._origPos);
+            posAttr.needsUpdate = true;
+          }
+          mesh.visible = true;
+        }
+        resetAllVisemes();
+        info.textContent = 'Reset all';
+      };
+      row.appendChild(resetBtn);
+
+      panel.appendChild(row);
+      document.body.appendChild(panel);
+    }
+
+    // Show debug panel when loaded standalone (not in iframe)
+    if (window === window.top) {
+      setTimeout(createDebugPanel, 500);
+      setTimeout(createChatPanel, 600);
+    }
+
+    // ─── Chat panel — talk to the avatar via backend pipeline ───
+    function createChatPanel() {
+      const panel = document.createElement('div');
+      panel.id = 'chat-panel';
+      panel.style.cssText = 'position:fixed;top:10px;right:10px;width:360px;background:rgba(255,255,255,0.95);border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);font-family:system-ui,sans-serif;z-index:9999;overflow:hidden;';
+
+      const header = document.createElement('div');
+      header.style.cssText = 'background:#1a73e8;color:#fff;padding:12px 16px;font-size:15px;font-weight:600;';
+      header.textContent = 'Dr. Priya Sharma';
+      panel.appendChild(header);
+
+      const messages = document.createElement('div');
+      messages.id = 'chat-messages';
+      messages.style.cssText = 'max-height:260px;overflow-y:auto;padding:12px;';
+      panel.appendChild(messages);
+
+      const status = document.createElement('div');
+      status.id = 'chat-status';
+      status.style.cssText = 'padding:4px 16px;font-size:11px;color:#888;';
+      panel.appendChild(status);
+
+      const inputRow = document.createElement('div');
+      inputRow.style.cssText = 'display:flex;padding:8px;border-top:1px solid #eee;';
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = 'chat-input';
+      input.placeholder = 'Ask Dr. Priya...';
+      input.style.cssText = 'flex:1;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none;';
+
+      const sendBtn = document.createElement('button');
+      sendBtn.textContent = 'Send';
+      sendBtn.style.cssText = 'margin-left:6px;padding:10px 18px;background:#1a73e8;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;';
+
+      inputRow.appendChild(input);
+      inputRow.appendChild(sendBtn);
+      panel.appendChild(inputRow);
+      document.body.appendChild(panel);
+
+      // Handlers
+      const BACKEND = 'http://localhost:8000';
+
+      function addMessage(role, text) {
+        const div = document.createElement('div');
+        div.style.cssText = `margin-bottom:8px;padding:8px 12px;border-radius:8px;font-size:13px;line-height:1.4;max-width:90%;${
+          role === 'user'
+            ? 'background:#e3f2fd;margin-left:auto;text-align:right;'
+            : 'background:#f5f5f5;'
+        }`;
+        div.textContent = text;
+        messages.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
+      }
+
+      async function sendMessage() {
+        const text = input.value.trim();
+        if (!text) return;
+        input.value = '';
+        addMessage('user', text);
+        status.textContent = 'Thinking...';
+        sendBtn.disabled = true;
+
+        try {
+          const res = await fetch(`${BACKEND}/api/chat/speak`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+          });
+
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: res.statusText }));
+            throw new Error(err.detail || res.statusText);
+          }
+
+          const data = await res.json();
+          addMessage('assistant', data.response_text);
+          status.textContent = `${data.model} · ${data.tokens} tokens`;
+
+          // Play audio + lip sync
+          if (data.audio_data && data.mouth_cues) {
+            // Prefer HeadAudio for real-time lip sync
+            if (headAudioReady && headAudio) {
+              await connectAudioToHeadAudio(data.audio_data);
+            } else {
+              // Fallback: cue-based lip sync + HTML Audio
+              startLipSync(data.mouth_cues);
+              const audio = new Audio(data.audio_data);
+              audio.play().catch(e => console.warn('Audio play failed:', e));
+            }
+          }
+
+        } catch (err) {
+          addMessage('system', `Error: ${err.message}`);
+          status.textContent = 'Error';
+        } finally {
+          sendBtn.disabled = false;
+        }
+      }
+
+      sendBtn.onclick = sendMessage;
+      input.onkeydown = (e) => { if (e.key === 'Enter') sendMessage(); };
+    }
+  </script>
+</body>
+</html>
