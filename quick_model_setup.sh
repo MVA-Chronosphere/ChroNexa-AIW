@@ -134,7 +134,7 @@ NODESCRIPT
         
         MODEL_FILENAME=$(basename "$MODEL_FILE")
         echo "Update frontend/src/services/avatar.ts:"
-        echo "  Replace: const modelUrl = '/pablo_doctor.glb'"
+        echo "  Replace: const modelUrl = '/indian_doctor_lipsync.glb'"
         echo "  With:    const modelUrl = '/$MODEL_FILENAME'"
         echo ""
         
@@ -142,7 +142,7 @@ NODESCRIPT
         read -p "Do you want me to update avatar.ts automatically? (y/n) " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            sed -i "" "s|'/pablo_doctor.glb'|'/$MODEL_FILENAME'|g" \
+            sed -i "" "s|'/indian_doctor_lipsync.glb'|'/$MODEL_FILENAME'|g" \
                 "$WORKSPACE_DIR/frontend/src/services/avatar.ts"
             echo "✅ Updated avatar.ts"
         fi

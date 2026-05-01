@@ -11,11 +11,13 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Indian English female voices from Edge TTS
+# Indian voices from Edge TTS — English and Hindi
 INDIAN_VOICES = {
-    "female": "en-IN-NeerjaNeural",      # Indian English female
+    "female": "en-IN-NeerjaNeural",              # Indian English female
     "female_expressive": "en-IN-NeerjaExpressiveNeural",
-    "male": "en-IN-PrabhatNeural",        # Indian English male
+    "male": "en-IN-PrabhatNeural",                # Indian English male
+    "hindi_female": "hi-IN-SwaraNeural",           # Hindi female
+    "hindi_male": "hi-IN-MadhurNeural",            # Hindi male
 }
 
 # Audio output directory
@@ -24,11 +26,12 @@ AUDIO_DIR.mkdir(exist_ok=True)
 
 
 class TextToSpeechService:
-    """Service for text-to-speech generation with Indian accent"""
+    """Service for text-to-speech generation with Indian accent (English + Hindi)"""
     
     def __init__(self):
         self.provider = settings.tts_provider
         self.voice = INDIAN_VOICES.get("female", "en-IN-NeerjaNeural")
+        self.hindi_voice = INDIAN_VOICES.get("hindi_female", "hi-IN-SwaraNeural")
         self.rate = settings.tts_rate
         
     async def synthesize(
@@ -36,10 +39,12 @@ class TextToSpeechService:
         text: str,
         output_path: Optional[str] = None,
         rate: Optional[float] = None,
+        lang: Optional[str] = None,
     ) -> str:
         """
         Synthesize text to speech with Indian accent.
-        Returns path to generated WAV/MP3 file.
+        Supports lang='en' (default) or lang='hi' for Hindi.
+        Returns path to generated MP3 file.
         """
         if output_path is None:
             timestamp = int(time.time() * 1000)
@@ -49,16 +54,19 @@ class TextToSpeechService:
         # Edge-TTS rate format: "+0%", "-10%", "+20%"
         rate_str = f"{int((speak_rate - 1.0) * 100):+d}%"
         
+        # Select voice based on language
+        voice = self.hindi_voice if lang == 'hi' else self.voice
+        
         try:
             communicate = edge_tts.Communicate(
                 text,
-                voice=self.voice,
+                voice=voice,
                 rate=rate_str,
             )
             await communicate.save(output_path)
             
             file_size = os.path.getsize(output_path)
-            logger.info(f"Edge-TTS: generated {file_size} bytes → {output_path}")
+            logger.info(f"Edge-TTS ({voice}): generated {file_size} bytes → {output_path}")
             return output_path
             
         except Exception as e:

@@ -47,7 +47,7 @@ The script will:
 2. Create head (0-5 seconds)
 3. Add 10 facial blend shapes (5-15 seconds)
 4. Create body parts (15-30 seconds)
-5. Add doctor's coat and stethoscope (30-40 seconds)
+5. Add accessories (30-40 seconds)
 6. Create skeleton/armature (40-50 seconds)
 7. Print success message (50-60 seconds)
 
@@ -65,10 +65,8 @@ In the **System Console** (bottom of Blender), you should see:
 
 Model Components:
   - Head with 10 facial blend shapes (A, E, I, O, U, F, M, B, P, X)
-  - Body (torso, arms, legs)
+  - Body (torso, arms, legs) - fully visible
   - Long black hair
-  - White doctor's coat
-  - Stethoscope
   - Skeleton armature for animation
 ```
 
@@ -85,9 +83,8 @@ Model Components:
 You should see:
 - ✓ Indian female face
 - ✓ Dark long hair
-- ✓ White doctor's coat
-- ✓ Stethoscope
-- ✓ Full body
+- ✓ Full body visible
+- ✓ No coat/stethoscope
 
 ---
 
@@ -276,8 +273,8 @@ Want to modify the avatar before exporting?
 - Multiply by 1.2 for larger, 0.8 for smaller
 
 ### Change Clothing
-- Edit "Coat" material color (white to blue for nursing scrubs)
-- Modify coat geometry (advanced)
+- Modify clothing materials as needed
+- Add custom textures or colors
 
 ---
 

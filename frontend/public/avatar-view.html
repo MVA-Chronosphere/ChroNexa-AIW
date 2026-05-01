@@ -28,8 +28,11 @@
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     document.body.appendChild(renderer.domElement);
 
-    // Lighting — pure ambient, zero directional/point lights
-    scene.add(new THREE.AmbientLight(0xffffff, 2.5));
+    // Lighting — ambient + subtle directional for desk depth
+    scene.add(new THREE.AmbientLight(0xffffff, 2.2));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(0.5, 1.5, 2);
+    scene.add(dirLight);
 
     let mixer = null;
     let model = null;
@@ -63,16 +66,14 @@
     let isFirstResponse = true;     // wave on first response
     // Store rest pose quaternions
     const restPose = {};
-    // Interlocked fingers idle pose (Euler offsets from T-pose rest)
-    // Axis map (from testing):
-    //   Upper arm: +X = arm down, -Z(right)/+Z(left) = arm forward
-    //   Forearm:   +X = drop down, -X = bend up
+    // Arms at sides — 78° down from T-pose, tiny forward so visible from front
+    // Right arm: +X=down, -Z=forward. Left arm: +X=down, +Z=forward (mirrored).
     const IDLE_POSE = {
-      rightUpper: [1.36, 0, 0],             // ~78° down from T-pose
-      rightFore:  [0, 0, 0],                // forearm hangs naturally
-      rightHand:  [0, 0, 0],                // hand relaxed
-      leftUpper:  [1.36, 0, 0],             // mirror
-      leftFore:   [0, 0, 0],
+      rightUpper: [1.36, 0, -0.12],           // 78° down + slight forward
+      rightFore:  [0.10, 0, 0],               // very slight forearm bend
+      rightHand:  [0, 0, 0],
+      leftUpper:  [1.36, 0, 0.12],            // mirror
+      leftFore:   [0.10, 0, 0],
       leftHand:   [0, 0, 0],
     };
     // Pre-computed idle target quaternions (set after bones are found)
@@ -108,25 +109,25 @@
     let headAudioSpeaking = false;  // true while HeadAudio detects speech
 
     // Per-viseme SCALE factors for HeadAudio output.
-    // HeadAudio outputs 0–1; we multiply by these to get final weight.
-    // This preserves speech dynamics (louder = slightly more movement)
-    // while keeping cheek-affecting shapes restrained.
+    // Tuned for English + Hindi bilingual speech.
+    // Hindi has more retroflex (DD), dental (TH), nasal (nn), and
+    // open vowels (aa/O) than English — these are boosted.
     const HA_SCALE = {
       'viseme_sil': 0.00,
-      'viseme_PP':  0.60,   // M/B/P — lips press
-      'viseme_FF':  0.50,   // F/V
-      'viseme_TH':  0.35,   // Th
-      'viseme_DD':  0.40,   // T/D
-      'viseme_kk':  0.30,   // K/G
-      'viseme_CH':  0.38,   // Ch/J/Sh
-      'viseme_SS':  0.28,   // S/Z
-      'viseme_nn':  0.32,   // N/L
-      'viseme_RR':  0.38,   // R
-      'viseme_aa':  0.55,   // Ah — jaw
-      'viseme_E':   0.12,   // Eh — cheeks — keep low
-      'viseme_I':   0.10,   // Ee — cheeks — keep low
-      'viseme_O':   0.50,   // Oh — lips
-      'viseme_U':   0.45,   // Oo — lips
+      'viseme_PP':  0.65,   // M/B/P — lips press (common in both)
+      'viseme_FF':  0.50,   // F/V — less common in Hindi but still needed
+      'viseme_TH':  0.52,   // Th/D dental — very common in Hindi (त, थ, द, ध)
+      'viseme_DD':  0.55,   // T/D retroflex — very common in Hindi (ट, ड, ठ, ढ)
+      'viseme_kk':  0.42,   // K/G — common in Hindi (क, ख, ग, घ)
+      'viseme_CH':  0.48,   // Ch/J/Sh — common in Hindi (च, छ, ज, झ, श)
+      'viseme_SS':  0.35,   // S/Z — common in both (स, ष)
+      'viseme_nn':  0.45,   // N/L — nasal sounds very common in Hindi (न, ण, ल)
+      'viseme_RR':  0.45,   // R — common in Hindi (र)
+      'viseme_aa':  0.65,   // Ah — jaw open — dominant in Hindi (आ, अ)
+      'viseme_E':   0.16,   // Eh — (ए, ऐ)
+      'viseme_I':   0.14,   // Ee — (ई, इ)
+      'viseme_O':   0.58,   // Oh — (ओ, औ)
+      'viseme_U':   0.52,   // Oo — (ऊ, उ)
     };
 
     async function initHeadAudio() {
@@ -226,30 +227,30 @@
     OCULUS_VISEMES.forEach(v => { currentWeights[v] = 0; targetWeights[v] = 0; });
 
     // Smoothing: higher = snappier mouth response
-    const LERP_SPEED = 0.25;
+    const LERP_SPEED = 0.32;
 
-    // Per-viseme weight caps — these are the PEAK weights.
-    // Lip/jaw shapes get strong values; cheek-affecting shapes stay low.
+    // Per-viseme weight caps — tuned for English + Hindi.
+    // Hindi speech uses wider jaw opening and more retroflex/dental shapes.
     const VISEME_MAX = {
       'viseme_sil': 0.00,
-      'viseme_PP':  0.60,   // M/B/P — lips press (most visible)
+      'viseme_PP':  0.60,   // M/B/P — lips press
       'viseme_FF':  0.50,   // F/V — lower lip tucks
-      'viseme_TH':  0.35,   // Th — tongue tip
-      'viseme_DD':  0.40,   // T/D — tongue tap
-      'viseme_kk':  0.30,   // K/G — back throat
-      'viseme_CH':  0.38,   // Ch/J/Sh
-      'viseme_SS':  0.28,   // S/Z — teeth parted
-      'viseme_nn':  0.32,   // N/L
-      'viseme_RR':  0.38,   // R
-      'viseme_aa':  0.55,   // Ah — jaw open
-      'viseme_E':   0.12,   // Eh — cheek stretcher — keep low
-      'viseme_I':   0.10,   // Ee — wide spread — keep low
-      'viseme_O':   0.50,   // Oh — lip rounding
-      'viseme_U':   0.45,   // Oo — tight round
+      'viseme_TH':  0.48,   // Th/dental — boosted for Hindi (त, थ, द, ध)
+      'viseme_DD':  0.50,   // T/D retroflex — boosted for Hindi (ट, ड)
+      'viseme_kk':  0.38,   // K/G — boosted for Hindi aspirates (क, ख, ग, घ)
+      'viseme_CH':  0.45,   // Ch/J/Sh — boosted for Hindi (च, छ, ज, श)
+      'viseme_SS':  0.32,   // S/Z
+      'viseme_nn':  0.40,   // N/L — nasal emphasis for Hindi (न, ण)
+      'viseme_RR':  0.42,   // R — Hindi (र)
+      'viseme_aa':  0.62,   // Ah — wide jaw, dominant Hindi vowel (आ)
+      'viseme_E':   0.15,   // Eh — (ए, ऐ) slightly higher
+      'viseme_I':   0.12,   // Ee — (ई)
+      'viseme_O':   0.55,   // Oh — (ओ, औ)
+      'viseme_U':   0.50,   // Oo — (ऊ)
     };
 
-    // Idle smile weight (very subtle viseme_I)
-    const IDLE_SMILE_WEIGHT = 0.015;
+    // Idle smile weight — visible, warm smile when not speaking
+    const IDLE_SMILE_WEIGHT = 0.09;
 
     function resetAllVisemes() {
       OCULUS_VISEMES.forEach(v => { targetWeights[v] = 0; });
@@ -261,10 +262,10 @@
         if (currentWeights[name] < 0.003) currentWeights[name] = 0;
       }
 
-      // Idle smile: when not speaking, hold a very subtle viseme_I
-      if (!lipSyncActive) {
+      // Idle smile: when not speaking, hold a warm smile
+      if (!lipSyncActive && !headAudioSpeaking) {
         if (currentWeights['viseme_I'] < IDLE_SMILE_WEIGHT) {
-          currentWeights['viseme_I'] += (IDLE_SMILE_WEIGHT - currentWeights['viseme_I']) * 0.02;
+          currentWeights['viseme_I'] += (IDLE_SMILE_WEIGHT - currentWeights['viseme_I']) * 0.04;
         }
       }
 
@@ -274,6 +275,19 @@
                          (currentWeights['viseme_E'] || 0) +
                          (currentWeights['viseme_DD'] || 0);
       const teethOpacity = Math.min(1.0, mouthOpen * 25); // ramp up quickly
+
+      // Jaw-head coupling: when mouth opens wide, head tilts back slightly (natural reflex)
+      if (headBone && restPose[headBone.name] && (headAudioSpeaking || lipSyncActive)) {
+        const jawInfluence = (currentWeights['viseme_aa'] || 0) * 0.6 +
+                             (currentWeights['viseme_O'] || 0) * 0.4 +
+                             (currentWeights['viseme_E'] || 0) * 0.2;
+        // Subtle backward tilt proportional to jaw openness (~2° max)
+        if (jawInfluence > 0.02) {
+          const tiltBack = jawInfluence * 0.06; // max ~3.4° at full open
+          const jq = new THREE.Quaternion().setFromEuler(new THREE.Euler(-tiltBack, 0, 0));
+          headBone.quaternion.multiply(jq);
+        }
+      }
 
       for (const mesh of morphMeshes) {
         if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) continue;
@@ -456,92 +470,38 @@
       console.log('[Gesture] Interlocked idle pose computed');
     }
 
-    // ─── Gesture library: 8 gesture types ───
-    // Each returns { right:{upper,fore,hand}, left:{upper,fore,hand} } Euler angles
-    // Forearm base bend = 0 (180° straight elbows). Each gesture defines its own bend.
+    // ─── Gesture library: subtle gestures from rest position ───
+    // Arms at sides by default. Gestures = small lifts/movements.
     // Axis map: Upper +X=down, -Z(R)/+Z(L)=forward. Fore -X=bend up, +X=drop.
-    // Rest is T-pose. Idle is arms at sides (upper X=1.36).
-    // Gestures should be SUBTLE — small lifts/movements near idle position.
     const GESTURE_LIBRARY = [
-      // 0: Right hand explain — slight raise + small elbow bend
-      { name: 'right-explain', fn: (t, I) => ({
+      // 0: Right hand gentle nod — very subtle wrist tilt while speaking
+      { name: 'right-nod', fn: (t, I) => ({
         right: {
-          upper: [1.10, 0, -0.15 + Math.sin(t*1.4)*0.05],   // slightly raised from idle
-          fore:  [-0.25 + Math.sin(t*1.8)*0.08, 0, 0],        // gentle elbow bend
-          hand:  [Math.sin(t*1.2)*0.10, 0.08, 0]
+          upper: [1.30, 0, -0.28 + Math.sin(t*1.2)*0.03],
+          fore:  [0.15 + Math.sin(t*1.5)*0.05, 0, 0],
+          hand:  [Math.sin(t*1.0)*0.06, 0, 0]
         }, left: null
       })},
-      // 1: Left hand explain (mirror)
-      { name: 'left-explain', fn: (t, I) => ({
+      // 1: Left hand gentle nod (mirror)
+      { name: 'left-nod', fn: (t, I) => ({
         right: null,
         left: {
-          upper: [1.10, 0, 0.15 + Math.sin(t*1.3+0.5)*0.05],
-          fore:  [-0.25 + Math.sin(t*1.7+0.3)*0.08, 0, 0],
-          hand:  [Math.sin(t*1.1+0.4)*0.10, -0.08, 0]
+          upper: [1.30, 0, 0.28 + Math.sin(t*1.1+0.4)*0.03],
+          fore:  [0.15 + Math.sin(t*1.4+0.3)*0.05, 0, 0],
+          hand:  [Math.sin(t*0.9+0.3)*0.06, 0, 0]
         }
       })},
-      // 2: Both hands open / welcoming — subtle outward
-      { name: 'both-open', fn: (t, I) => ({
+      // 2: Both hands calm — slight shift, very minimal
+      { name: 'calm', fn: (t, I) => ({
         right: {
-          upper: [1.15, 0, -0.10 + Math.sin(t*1.0)*0.04],
-          fore:  [-0.20, 0, 0],
-          hand:  [0, 0.10, Math.sin(t*1.3)*0.06]
+          upper: [1.32, 0, -0.27 + Math.sin(t*0.7)*0.02],
+          fore:  [0.18, 0, 0],
+          hand:  [0, 0, Math.sin(t*0.8)*0.04]
         },
         left: {
-          upper: [1.15, 0, 0.10 + Math.sin(t*1.0+0.3)*0.04],
-          fore:  [-0.20, 0, 0],
-          hand:  [0, -0.10, Math.sin(t*1.3+0.3)*0.06]
-        }
-      })},
-      // 3: Right hand emphasis — small pump
-      { name: 'right-emphasis', fn: (t, I) => ({
-        right: {
-          upper: [1.15, 0, -0.12],
-          fore:  [-0.30 + Math.sin(t*2.2)*0.10, 0, 0],
-          hand:  [Math.sin(t*2.5)*0.12, 0.05, 0]
-        }, left: null
-      })},
-      // 4: Left hand enumerate
-      { name: 'left-enumerate', fn: (t, I) => ({
-        right: null,
-        left: {
-          upper: [1.15, 0, 0.12],
-          fore:  [-0.25, 0, 0],
-          hand:  [Math.sin(t*2.0)*0.10 + 0.05, -0.06, 0]
-        }
-      })},
-      // 5: Both hands steeple / thoughtful — hands come slightly forward
-      { name: 'steeple', fn: (t, I) => ({
-        right: {
-          upper: [1.20, 0, -0.20],
-          fore:  [-0.30 + Math.sin(t*1.5)*0.04, 0, 0],
-          hand:  [0, 0.12, 0]
-        },
-        left: {
-          upper: [1.20, 0, 0.20],
-          fore:  [-0.30 + Math.sin(t*1.5+0.2)*0.04, 0, 0],
-          hand:  [0, -0.12, 0]
-        }
-      })},
-      // 6: Right hand illustrate — moderate movement
-      { name: 'right-illustrate', fn: (t, I) => ({
-        right: {
-          upper: [1.05, 0, -0.18 + Math.sin(t*1.1)*0.06],
-          fore:  [-0.25 + Math.sin(t*1.6)*0.08, 0, 0],
-          hand:  [Math.sin(t*2.0)*0.12, Math.cos(t*1.4)*0.08, 0]
-        }, left: null
-      })},
-      // 7: Both hands calm / reassure — palms slightly out
-      { name: 'calm-reassure', fn: (t, I) => ({
-        right: {
-          upper: [1.25, 0, -0.10 + Math.sin(t*0.8)*0.03],
-          fore:  [-0.15, 0, 0],
-          hand:  [-0.10, 0, Math.sin(t*0.8)*0.05]
-        },
-        left: {
-          upper: [1.25, 0, 0.10 + Math.sin(t*0.8+0.5)*0.03],
-          fore:  [-0.15, 0, 0],
-          hand:  [-0.10, 0, Math.sin(t*0.8+0.5)*0.05]
+          upper: [1.32, 0, 0.27 + Math.sin(t*0.7+0.4)*0.02],
+          fore:  [0.18, 0, 0],
+          hand:  [0, 0, Math.sin(t*0.8+0.4)*0.04]
         }
       })}
     ];
@@ -786,19 +746,23 @@
       // ── Head nod during speech (independent of arm gestures) ──
       if (headBone && restPose[headBone.name]) {
         const ht = elapsed / 1000;
-        // Gentle nod (pitch) + very subtle tilt (roll) — conversational
-        const nodX = Math.sin(ht * 1.8) * 0.06 + Math.sin(ht * 0.7) * 0.03; // ~5° nod
-        const tiltZ = Math.sin(ht * 0.9 + 0.5) * 0.025; // ~1.5° tilt
+        // Multi-frequency nod (pitch) — feels organic, not mechanical
+        const nodX = Math.sin(ht * 1.8) * 0.06 + Math.sin(ht * 0.7) * 0.03 + Math.sin(ht * 3.1) * 0.015;
+        // Subtle yaw turns — looks at imaginary points while explaining
+        const yawY = Math.sin(ht * 0.5) * 0.04 + Math.sin(ht * 1.3 + 1.0) * 0.02;
+        // Gentle tilt (roll)
+        const tiltZ = Math.sin(ht * 0.9 + 0.5) * 0.025;
         const hq = restPose[headBone.name].clone();
-        const hg = new THREE.Quaternion().setFromEuler(new THREE.Euler(nodX, 0, tiltZ));
+        const hg = new THREE.Quaternion().setFromEuler(new THREE.Euler(nodX, yawY, tiltZ));
         headBone.quaternion.copy(hq).multiply(hg);
       }
       if (neckBone && restPose[neckBone.name]) {
         const ht = elapsed / 1000;
         // Neck follows head at ~40% intensity, slightly delayed
         const neckX = Math.sin(ht * 1.8 - 0.15) * 0.025;
+        const neckY = Math.sin(ht * 0.5 - 0.2) * 0.016;  // follows yaw gently
         const nq = restPose[neckBone.name].clone();
-        const ng = new THREE.Quaternion().setFromEuler(new THREE.Euler(neckX, 0, 0));
+        const ng = new THREE.Quaternion().setFromEuler(new THREE.Euler(neckX, neckY, 0));
         neckBone.quaternion.copy(nq).multiply(ng);
       }
 
@@ -876,12 +840,57 @@
     // Idle: return to interlocked fingers pose when not speaking
     function updateIdleGesture() {
       if (gestureActive || _testMode || !rightUpperArm) return;
-      [leftUpperArm, rightUpperArm, leftForeArm, rightForeArm, leftHand, rightHand].forEach(bone => {
-        slerpToIdle(bone, 0.08); // smooth return to clasped hands
+
+      // Subtle arm breathing sway — makes idle pose feel alive
+      const it = Date.now() / 1000;
+      const armSwayR = Math.sin(it * 0.6) * 0.015;       // very gentle Z sway
+      const armSwayL = Math.sin(it * 0.6 + 0.5) * 0.015;
+      const foreSwayR = Math.sin(it * 0.9) * 0.02;
+      const foreSwayL = Math.sin(it * 0.9 + 0.4) * 0.02;
+
+      // Slerp arms toward idle + sway
+      if (rightUpperArm && idlePoseQuats[rightUpperArm.name]) {
+        const sway = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, armSwayR));
+        const target = idlePoseQuats[rightUpperArm.name].clone().multiply(sway);
+        rightUpperArm.quaternion.slerp(target, 0.05);
+      }
+      if (leftUpperArm && idlePoseQuats[leftUpperArm.name]) {
+        const sway = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, armSwayL));
+        const target = idlePoseQuats[leftUpperArm.name].clone().multiply(sway);
+        leftUpperArm.quaternion.slerp(target, 0.05);
+      }
+      if (rightForeArm && idlePoseQuats[rightForeArm.name]) {
+        const sway = new THREE.Quaternion().setFromEuler(new THREE.Euler(foreSwayR, 0, 0));
+        const target = idlePoseQuats[rightForeArm.name].clone().multiply(sway);
+        rightForeArm.quaternion.slerp(target, 0.05);
+      }
+      if (leftForeArm && idlePoseQuats[leftForeArm.name]) {
+        const sway = new THREE.Quaternion().setFromEuler(new THREE.Euler(foreSwayL, 0, 0));
+        const target = idlePoseQuats[leftForeArm.name].clone().multiply(sway);
+        leftForeArm.quaternion.slerp(target, 0.05);
+      }
+      [rightHand, leftHand].forEach(bone => {
+        slerpToIdle(bone, 0.05);
       });
-      // Head/neck return to rest (no idle tilt)
-      slerpToRest(headBone, 0.08);
-      slerpToRest(neckBone, 0.08);
+      // Head/neck: gentle idle breathing sway instead of static rest
+      if (headBone && restPose[headBone.name]) {
+        // Very subtle breathing nod (~1°) + occasional micro-tilt
+        const breathX = Math.sin(it * 0.8) * 0.012;
+        const microTilt = Math.sin(it * 0.35) * 0.008;
+        const hq = restPose[headBone.name].clone();
+        const hg = new THREE.Quaternion().setFromEuler(new THREE.Euler(breathX, 0, microTilt));
+        headBone.quaternion.slerp(hq.multiply(hg), 0.06);
+      } else {
+        slerpToRest(headBone, 0.08);
+      }
+      if (neckBone && restPose[neckBone.name]) {
+        const breathNeckX = Math.sin(it * 0.8 - 0.3) * 0.006;
+        const nq = restPose[neckBone.name].clone();
+        const ng = new THREE.Quaternion().setFromEuler(new THREE.Euler(breathNeckX, 0, 0));
+        neckBone.quaternion.slerp(nq.multiply(ng), 0.06);
+      } else {
+        slerpToRest(neckBone, 0.08);
+      }
     }
 
     // ─── Load avatar ───
@@ -948,6 +957,7 @@
                 'verts:', node.geometry.getAttribute('position')?.count,
                 'hasMorph:', hasMorphDict);
             } else {
+              // Hide any non-skinned meshes
               node.visible = false;
             }
           }
@@ -963,6 +973,9 @@
         window._allSkinnedMeshes = allSkinnedMeshes;
 
         scene.add(model);
+
+        // Wait for matrixWorld to update before bounding box
+        model.updateMatrixWorld(true);
 
         if (gltf.animations.length > 0) {
           mixer = new THREE.AnimationMixer(model);
@@ -1014,10 +1027,12 @@
         const size = new THREE.Vector3().subVectors(max, min);
         const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
 
-        // Waist-to-head framing
-        const lookY = min.y + size.y * 0.43;
-        const dist = size.y * 0.55;
-        camera.position.set(center.x, lookY, center.z + dist);
+        // ─── No desk for now — will add back once arm pose is correct ───
+
+        // ─── Camera: straight-on view, looking at 40% height ───
+        const lookY = min.y + size.y * 0.40;
+        const camDist = size.y * 0.42;
+        camera.position.set(center.x, lookY + size.y * 0.15, center.z + camDist);
         camera.lookAt(center.x, lookY, center.z);
 
         console.log('[AvatarView] Camera ready. morphTargets:', Object.keys(morphTargetMap).length);
@@ -1048,7 +1063,6 @@
           console.error('[AvatarView] NO headMesh found! No mesh has morphTargetDictionary.');
         }
 
-        // Initialize HeadAudio after avatar is loaded
         initHeadAudio();
         // Initialize gesture bones
         initGestureBones();

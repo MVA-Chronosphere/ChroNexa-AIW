@@ -104,14 +104,21 @@ class LipSyncService:
             return self._placeholder_cues(text or "")
     
     def _placeholder_cues(self, text: str) -> dict:
-        """Generate simple placeholder mouth cues from text length."""
+        """Generate placeholder mouth cues from text — supports English + Hindi."""
         if not text:
             return {"mouthCues": [], "duration": 0}
         
-        # Rough timing: ~4 chars per second, alternate shapes
-        chars_per_sec = 4.0
+        # Detect if text contains Devanagari (Hindi)
+        has_hindi = any('\u0900' <= ch <= '\u097F' for ch in text)
+        
+        # Hindi speech is slightly slower with more open-mouth shapes
+        chars_per_sec = 3.5 if has_hindi else 4.0
+        # Hindi-weighted shapes: more D(aa), H(TH), C(E) for dental/retroflex sounds
+        shapes_en = ["X", "D", "C", "B", "E", "F", "A"]
+        shapes_hi = ["X", "D", "D", "H", "C", "E", "A", "B", "H", "D"]
+        shapes = shapes_hi if has_hindi else shapes_en
+        
         duration = len(text) / chars_per_sec
-        shapes = ["X", "D", "C", "B", "E", "F", "A"]
         cues = []
         words = text.split()
         t = 0.0

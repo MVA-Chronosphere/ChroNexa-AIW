@@ -8,8 +8,8 @@ echo ""
 
 # Check file exists
 echo "1. Checking model file..."
-if [ -f "frontend/public/indian_doctor.glb" ]; then
-    SIZE=$(ls -lh frontend/public/indian_doctor.glb | awk '{print $5}')
+if [ -f "frontend/public/indian_doctor_lipsync.glb" ]; then
+    SIZE=$(ls -lh frontend/public/indian_doctor_lipsync.glb | awk '{print $5}')
     echo "   ✓ Model file exists: $SIZE"
 else
     echo "   ✗ Model file NOT found!"
@@ -36,7 +36,7 @@ import json
 import struct
 
 try:
-    with open("frontend/public/indian_doctor.glb", "rb") as f:
+    with open("frontend/public/indian_doctor_lipsync.glb", "rb") as f:
         data = f.read()
         offset = 12
         chunk_size = struct.unpack('<I', data[offset:offset+4])[0]

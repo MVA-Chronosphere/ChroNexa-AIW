@@ -8,7 +8,7 @@ echo "================================"
 # We'll use a free model from Sketchfab or create one programmatically
 # For now, let's use a Python-based approach with gltf-pipeline
 
-DEST="/Users/chiefaiofficer/ChroNexa-AIW/frontend/public/indian_doctor.glb"
+DEST="/Users/chiefaiofficer/ChroNexa-AIW/frontend/public/indian_doctor_lipsync.glb"
 
 # Check if we have Python with necessary libs
 python3 << 'PYTHON_SCRIPT'

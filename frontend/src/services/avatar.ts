@@ -110,8 +110,8 @@ export class IndianDoctorAvatar {
     const loader = new GLTFLoader()
     let modelLoaded = false
     
-    // Load Indian female doctor avatar
-    const modelUrl = '/indian_doctor.glb'
+    // Load Indian female avatar - full body visible without coat/stethoscope
+    const modelUrl = '/indian_doctor_lipsync.glb'
 
     console.log(`[IndianDoctorAvatar] Attempting to load model from: ${modelUrl}`)
     
@@ -228,13 +228,13 @@ export class IndianDoctorAvatar {
     head.castShadow = true
     this.avatar.add(head)
 
-    // Body (white coat)
-    const bodyGeometry = new THREE.BoxGeometry(0.5, 0.8, 0.3)
-    const coatMaterial = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.6
+    // Body (simple dress/clothing - no coat)
+    const bodyGeometry = new THREE.BoxGeometry(0.4, 0.8, 0.25)
+    const bodyMaterial = new THREE.MeshStandardMaterial({
+      color: 0x6b4c9a,
+      roughness: 0.7
     })
-    const body = new THREE.Mesh(bodyGeometry, coatMaterial)
+    const body = new THREE.Mesh(bodyGeometry, bodyMaterial)
     body.position.y = -0.1
     body.castShadow = true
     this.avatar.add(body)

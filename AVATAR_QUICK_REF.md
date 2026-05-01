@@ -53,10 +53,9 @@
 
 ## Avatar Features
 
-✓ Indian female doctor appearance
+✓ Indian female appearance
 ✓ Dark long hair
-✓ White doctor's coat
-✓ Stethoscope
+✓ Full visible body (chest, waist, arms, legs)
 ✓ 10 facial blend shapes (A, E, I, O, U, F, M, B, P, X)
 ✓ Skeleton for animation
 ✓ Realistic materials

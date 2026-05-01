@@ -10,9 +10,8 @@ Choose one of these free AI image generators:
 3. Use **Image Generation** → Text-to-Image
 4. **Prompt to use:**
 ```
-A professional female Indian doctor, 
+A professional female Indian person, 
 Indian facial features, brown skin tone,
-wearing white medical coat, stethoscope,
 warm welcoming expression,
 realistic portrait, front view,
 neutral background,

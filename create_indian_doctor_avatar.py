@@ -20,7 +20,7 @@ import math
 from mathutils import Vector
 
 MICHELLE_PATH = "/tmp/avatar_downloads/threejs_Michelle.glb"
-OUTPUT_PATH = "/Users/chiefaiofficer/ChroNexa-AIW/frontend/public/indian_doctor.glb"
+OUTPUT_PATH = "/Users/chiefaiofficer/ChroNexa-AIW/frontend/public/indian_doctor_lipsync.glb"
 
 
 def clear_scene():
@@ -301,9 +301,9 @@ def main():
     # 3. Adjust materials for Indian skin tone
     adjust_character_materials(character)
     
-    # 4. Add doctor attire
-    add_doctor_coat(center, size)
-    add_stethoscope(center, size)
+    # 4. Add accessories (no coat needed)
+    # add_doctor_coat(center, size)  # NOT NEEDED - body visible without coat
+    # add_stethoscope(center, size)  # NOT NEEDED
     add_name_tag(center, size)
     add_bindi(center, size)
     
@@ -317,7 +317,6 @@ def main():
     print(f"  Base model: Michelle (realistic female character)")
     print(f"  Modifications:")
     print(f"    ✓ Indian skin tone applied")
-    print(f"    ✓ White doctor's coat with collar & lapels")
     print(f"    ✓ Stethoscope (tube + diaphragm)")
     print(f"    ✓ Red bindi (forehead)")
     print(f"    ✓ Name tag")
